@@ -56,7 +56,7 @@ class _SetupWorker(QObject):
 class SetupDialog(QDialog):
     def __init__(self, setup: FirstRunSetup, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("scom - 初回セットアップ")
+        self.setWindowTitle("scom-v - 初回セットアップ")
         self.setModal(True)
         self.resize(720, 560)
         bind_geometry(self, "setup")
@@ -89,10 +89,18 @@ class SetupDialog(QDialog):
         plan_lbl.setWordWrap(True)
         layout.addWidget(plan_lbl)
 
-        # ドライバ起因の性能警告（赤）。SageAttention と int8_convrot の高速化
-        # は、それぞれ一定以上の NVIDIA ドライバが前提になる。
+        # 性能・実行可否の警告（赤）。SageAttention と int8_convrot の高速化は
+        # 一定以上の NVIDIA ドライバが前提。さらに MiniMax H3（33B級）は
+        # オフロード前提のためシステム RAM が少ないと実行が困難になる。
         gpu = environment.detect_gpu()
         warns = []
+        ram = environment.detect_ram_gb()
+        if ram is not None and ram < environment.RAM_MIN_GB:
+            warns.append(
+                f"・システムメモリが {ram:.0f}GB です。MiniMax H3 の実行には "
+                f"{environment.RAM_MIN_GB}GB 以上を強く推奨します"
+                "（モデルのオフロードに必要。不足すると実行不能または極端に"
+                "低速になります）。")
         if gpu.has_nvidia and gpu.driver_version:
             if gpu.driver_version < environment.SAGE_MIN_DRIVER:
                 warns.append(
@@ -107,8 +115,7 @@ class SetupDialog(QDialog):
                     f"{gpu.driver_version:g}）。この構成では INT8 GEMM が"
                     "使えず約2倍遅くなります。")
         if warns:
-            warn_lbl = QLabel(
-                "NVIDIA ドライバの更新を推奨します:\n" + "\n".join(warns))
+            warn_lbl = QLabel("環境に関する警告:\n" + "\n".join(warns))
             warn_lbl.setStyleSheet("color:#e33; font-weight:bold;")
             warn_lbl.setWordWrap(True)
             layout.addWidget(warn_lbl)
@@ -132,7 +139,8 @@ class SetupDialog(QDialog):
         layout.addWidget(self.chk_sage)
 
         hint = QLabel(
-            "生成には base・VAE・text encoder が必須です。preview 系は任意です。\n"
+            "t2v/i2v には fl2va セット、r2v には ref2va セットが必要です"
+            "（TE・VAE は共通。1セット約54GB、追加セット +21GB）。\n"
             "自分でダウンロードしたものを models/ 配下に配置済みなら、ここで"
             "選ばなくても利用できます。"
         )

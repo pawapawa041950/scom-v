@@ -28,7 +28,6 @@ from typing import Callable, Optional
 import websocket  # websocket-client
 
 from . import config
-from .comfy_custom_nodes import ensure_custom_nodes
 from .textutil import strip_ansi
 
 
@@ -45,26 +44,15 @@ def _free_port(preferred: int = 8199) -> int:
 
 
 def write_extra_model_paths(paths: config.AppPaths) -> Path:
-    """Write extra_model_paths.yaml pointing ComfyUI at our models folder.
-
-    Also installs the scom custom nodes (ScomMergeModel) and registers their
-    directory — an absolute path passes through ComfyUI's os.path.join with
-    base_path unchanged, so it can live outside the models tree.
-    """
+    """Write extra_model_paths.yaml pointing ComfyUI at our models folder."""
     models = paths.models
-    nodes_dir = ensure_custom_nodes(paths)
     yaml_text = (
-        "scom:\n"
+        "scomv:\n"
         f"  base_path: {models.as_posix()}\n"
         "  is_default: true\n"
         "  diffusion_models: diffusion_models/\n"
-        # フルチェックポイント（VAE/CLIP 内蔵）を CheckpointLoaderSimple から
-        # 読めるよう、同じ diffusion_models フォルダを checkpoints にも割り当てる。
-        "  checkpoints: diffusion_models/\n"
         "  vae: vae/\n"
         "  text_encoders: text_encoders/\n"
-        "  loras: loras/\n"
-        f"  custom_nodes: {nodes_dir.as_posix()}\n"
     )
     out = paths.user_data / "extra_model_paths.yaml"
     out.write_text(yaml_text, encoding="utf-8")
@@ -129,7 +117,7 @@ class ComfyBackend:
             "--listen", self.host,
             "--port", str(self.port),
             "--extra-model-paths-config", str(extra_paths),
-            "--output-directory", str(self.paths.user_data / "output"),
+            "--output-directory", str(self.paths.output_dir),
             "--preview-method", "auto",  # stream latent previews over the ws
             "--disable-auto-launch",
         ]
@@ -143,7 +131,7 @@ class ComfyBackend:
             else:
                 log("SageAttention が未インストールのため無効で起動します"
                     "（「設定…」から導入できます）")
-        (self.paths.user_data / "output").mkdir(parents=True, exist_ok=True)
+        self.paths.output_dir.mkdir(parents=True, exist_ok=True)
         log(f"ComfyUI を起動中: {' '.join(cmd)}")
 
         creationflags = 0
@@ -234,45 +222,83 @@ class ComfyBackend:
             raise BackendError(f"prompt が拒否されました: {detail}") from e
         return data["prompt_id"]
 
-    def _fetch_image(self, filename: str, subfolder: str, ftype: str) -> bytes:
-        qs = urllib.parse.urlencode(
-            {"filename": filename, "subfolder": subfolder, "type": ftype}
-        )
-        with urllib.request.urlopen(self.base_url + "/view?" + qs, timeout=30) as resp:
-            return resp.read()
+    def _history_files(self, prompt_id: str) -> list[Path]:
+        """Saved output files of a finished prompt, as absolute paths.
 
-    def _history_images(self, prompt_id: str) -> list[bytes]:
+        SaveVideo 等の出力は history に {filename, subfolder, type} で載る
+        （キー名は images/videos などノードにより異なるため全キーを走査）。
+        バックエンドは --output-directory でアプリの output/ を指しているので、
+        /view でダウンロードし直さずローカルパスをそのまま解決できる。
+        """
         with urllib.request.urlopen(
             self.base_url + f"/history/{prompt_id}", timeout=30
         ) as resp:
             history = json.loads(resp.read())
         entry = history.get(prompt_id, {})
-        images: list[bytes] = []
+        out_dir = self.paths.output_dir
+        files: list[Path] = []
         for node_out in entry.get("outputs", {}).values():
-            for img in node_out.get("images", []):
-                images.append(
-                    self._fetch_image(img["filename"], img.get("subfolder", ""),
-                                      img.get("type", "output"))
-                )
-        return images
+            for items in node_out.values():
+                if not isinstance(items, list):
+                    continue
+                for it in items:
+                    if not (isinstance(it, dict) and it.get("filename")):
+                        continue
+                    if it.get("type", "output") != "output":
+                        continue  # temp プレビュー等は成果物ではない
+                    p = out_dir / it.get("subfolder", "") / it["filename"]
+                    if p.exists() and p not in files:
+                        files.append(p)
+        return files
+
+    def upload_input_file(self, path: Path) -> str:
+        """Upload a local file into the backend's input directory.
+
+        LoadImage / LoadVideo / LoadAudio が参照できる名前を返す（ComfyUI の
+        /upload/image は画像以外のファイルもそのまま input へ保存する）。
+        同名ファイルは ComfyUI 側がリネームで衝突回避し、その名前が返る。
+        """
+        path = Path(path)
+        data = path.read_bytes()
+        boundary = "----scomv" + uuid.uuid4().hex
+        fname = path.name.replace('"', "_")
+        body = (
+            (f"--{boundary}\r\n"
+             f'Content-Disposition: form-data; name="image"; '
+             f'filename="{fname}"\r\n'
+             "Content-Type: application/octet-stream\r\n\r\n").encode()
+            + data
+            + f"\r\n--{boundary}--\r\n".encode()
+        )
+        req = urllib.request.Request(
+            self.base_url + "/upload/image", data=body,
+            headers={"Content-Type":
+                     f"multipart/form-data; boundary={boundary}"})
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                info = json.loads(resp.read())
+        except urllib.error.URLError as e:
+            raise BackendError(f"ファイルのアップロードに失敗: {e}") from e
+        name = info.get("name", fname)
+        sub = info.get("subfolder", "")
+        return f"{sub}/{name}" if sub else name
 
     def generate(self, graph: dict,
                  on_progress: Optional[Callable[[Progress], None]] = None,
                  on_preview: Optional[Callable[[bytes], None]] = None,
                  cancel: Optional[Callable[[], bool]] = None,
                  on_cached: Optional[Callable[[list], None]] = None,
-                 on_timing: Optional[Callable[[float], None]] = None) -> list[bytes]:
-        """Run a graph to completion and return output PNG bytes.
+                 on_timing: Optional[Callable[[float], None]] = None) -> list[Path]:
+        """Run a graph to completion and return the saved output file paths
+        (SaveVideo が userdata/output に書いた動画等の絶対パス)。
 
         ``on_progress`` receives Progress updates; ``on_preview`` receives raw
         JPEG/PNG bytes of intermediate latent previews; ``cancel`` is polled
         and, if it returns True, the run is interrupted. ``on_cached`` receives
         the node ids served from the backend's output cache (sent once at the
-        start of execution) — the app uses it to tell whether a merged model
-        was still in RAM or had to be rebuilt. ``on_timing`` receives, at
-        completion, the pure inference time in seconds — the wall time the
-        backend spent executing sampler (KSampler) nodes only, excluding model
-        loading / text encoding / VAE decode.
+        start of execution). ``on_timing`` receives, at completion, the pure
+        inference time in seconds — the wall time the backend spent executing
+        sampler nodes only, excluding model loading / text encode / VAE decode.
         """
         if not self.is_running():
             raise BackendError("バックエンドが起動していません")
@@ -285,7 +311,8 @@ class ComfyBackend:
         # executing イベントはノード開始時に飛ぶので、サンプラーに入った時刻
         # から次のノードへ移った時刻までを積算する。
         sampler_nodes = {nid for nid, node in graph.items()
-                         if node.get("class_type") == "KSampler"}
+                         if node.get("class_type") in ("KSampler",
+                                                       "SamplerCustomAdvanced")}
         sample_secs = 0.0
         sample_enter: Optional[float] = None
 
@@ -347,7 +374,7 @@ class ComfyBackend:
 
         if on_timing is not None and sample_secs > 0:
             on_timing(sample_secs)
-        return self._history_images(prompt_id)
+        return self._history_files(prompt_id)
 
     def interrupt(self) -> None:
         try:
@@ -360,8 +387,7 @@ class ComfyBackend:
         """Ask the backend to drop ALL cached node outputs and loaded models.
 
         ComfyUI has no per-entry cache eviction, so this is all-or-nothing;
-        anything still needed is rebuilt/reloaded on next use. (Pinned merged
-        models are separate — see release_merge/release_all_merges.)
+        anything still needed is rebuilt/reloaded on next use.
         """
         payload = json.dumps({"unload_models": True, "free_memory": True}).encode()
         req = urllib.request.Request(
@@ -369,33 +395,6 @@ class ComfyBackend:
             headers={"Content-Type": "application/json"},
         )
         urllib.request.urlopen(req, timeout=10)
-
-    # ----- scom merge pin cache (routes served by our custom node) ---------
-    def merge_pinned(self) -> list[str]:
-        """Pin-cache keys of merged models currently held in backend RAM."""
-        with urllib.request.urlopen(self.base_url + "/scom/merges",
-                                    timeout=5) as resp:
-            return list(json.loads(resp.read()).get("pinned", []))
-
-    def _post_merge_release(self, payload: dict) -> int:
-        req = urllib.request.Request(
-            self.base_url + "/scom/merge_release",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return int(json.loads(resp.read()).get("released", 0))
-
-    def release_merge(self, recipe: str, quantize: str,
-                      low_memory: bool) -> int:
-        """Free one pinned merged model from backend RAM."""
-        return self._post_merge_release({
-            "recipe": recipe, "quantize": quantize,
-            "low_memory": bool(low_memory)})
-
-    def release_all_merges(self) -> int:
-        """Free every pinned merged model from backend RAM."""
-        return self._post_merge_release({"all": True})
 
     def object_info(self, class_type: str) -> dict:
         """Fetch node metadata (used to discover valid sampler/clip options)."""

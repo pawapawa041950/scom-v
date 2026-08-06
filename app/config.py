@@ -11,19 +11,18 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Application identity. Embedded into saved-image metadata (Software / Version
-# tags) so files can be recognized as produced by this app.
-APP_NAME = "scom"
-APP_VERSION = "1.0.0"
+# Application identity.
+APP_NAME = "scom-v"
+APP_VERSION = "0.1.0"
 APP_SIGNATURE = f"{APP_NAME} {APP_VERSION}"
 
 # Model file extensions we consider selectable.
 MODEL_EXTENSIONS = (".safetensors", ".sft", ".ckpt", ".pt", ".gguf", ".bin")
 
-# Model component subdirectories under ``models/``. Names match both the
-# ComfyUI model categories (used in extra_model_paths.yaml) and the upstream
-# Hugging Face ``split_files`` layout, so the mapping is 1:1.
-MODEL_DIRS = ("diffusion_models", "vae", "text_encoders", "loras")
+# Model component subdirectories under ``models/``. Names match the ComfyUI
+# model categories (used in extra_model_paths.yaml) and the Comfy-Org
+# MiniMax-H3 repackage layout, so the mapping is 1:1.
+MODEL_DIRS = ("diffusion_models", "vae", "text_encoders")
 
 
 def base_dir() -> Path:

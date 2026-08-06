@@ -165,6 +165,38 @@ def choose_torch(gpu: GpuInfo) -> TorchPlan:
     )
 
 
+# MiniMax H3（33B級）はオフロード前提のため、システムRAMが少ないと実行不能
+# か極端に遅くなる。この値未満ならセットアップ画面で赤警告を出す。
+RAM_MIN_GB = 64
+
+
+def detect_ram_gb() -> Optional[float]:
+    """Physical RAM in GiB (Windows: GlobalMemoryStatusEx). None if unknown."""
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        st = MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return st.ullTotalPhys / (1024 ** 3)
+    except Exception:  # noqa: BLE001 - 非Windows/取得失敗は「不明」扱い
+        pass
+    return None
+
+
 def recommended_weight_dtype(gpu: GpuInfo, plan: TorchPlan) -> str:
     """Pick a default UNet dtype from available VRAM."""
     if not plan.is_cuda:

@@ -12,7 +12,7 @@ env/
 
 # Build artifacts (PyInstaller) — keep only the spec
 build/*
-!build/scom.spec
+!build/scomv.spec
 dist/
 
 # Local app data (created at runtime; may contain personal prompts/outputs)

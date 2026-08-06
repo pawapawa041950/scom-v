@@ -1,296 +1,234 @@
-"""Build a ComfyUI API-format workflow graph for the anima (separated) model.
+"""MiniMax H3 video generation graphs (ComfyUI API format).
 
-The graph uses separated components:
-  * UNETLoader        -> models/diffusion
-  * VAELoader         -> models/vae
-  * CLIPLoader / DualCLIPLoader -> models/te
+公式テンプレート (Comfy-Org/workflow_templates video_minimax_h3_*.json) の
+配線をそのまま API 形式で構築する:
 
-The result is a dict keyed by stringified node ids, ready to POST to the
-ComfyUI ``/prompt`` endpoint.
+  UNETLoader ─┬─(任意 MiniMaxH3SigmaShift)─┬→ BasicScheduler → sigmas
+              │                            └→ BasicGuider ← conditioning
+  CLIPLoader(type="minimax") ─┐
+  VAELoader(video) ───────────┼→ MiniMaxH3ImageToVideo / ReferenceToVideo
+  VAELoader(audio) ───────────┘        → (positive, LATENT[video+audio])
+  RandomNoise + KSamplerSelect + BasicGuider + sigmas
+      → SamplerCustomAdvanced → VAEDecode(video) → frames ┐
+                              → VAEDecodeAudio(audio) ────┼→ CreateVideo(24fps)
+                                                          └→ SaveVideo
+
+特徴: CFG 無し（BasicGuider）・ネガティブプロンプト無し。長さは 24fps の
+17n+5 フレームグリッドにスナップされる。
 """
 from __future__ import annotations
 
-import json
+import math
 from dataclasses import dataclass, field
 
-# Common option lists surfaced in the UI. These mirror ComfyUI's built-ins.
+FPS = 24
+
+# 公式テンプレの既定は res_multistep / simple / 20 steps。
 SAMPLERS = [
-    "er_sde", "euler", "euler_ancestral", "dpmpp_2m", "dpmpp_2m_sde",
-    "dpmpp_3m_sde", "dpmpp_sde", "dpm_2", "dpm_2_ancestral", "lms", "heun",
-    "ddim", "uni_pc",
+    "res_multistep", "euler", "euler_ancestral", "dpmpp_2m", "lms", "heun",
+    "ddim", "uni_pc", "er_sde",
 ]
-SCHEDULERS = [
-    "normal", "karras", "exponential", "sgm_uniform", "simple",
-    "ddim_uniform", "beta",
+SCHEDULERS = ["simple", "normal", "sgm_uniform", "beta", "karras",
+              "exponential"]
+
+# モデルが公式対応するアスペクト比（幅:高さ）。
+ASPECT_PRESETS = [
+    ("21:9", 21, 9),
+    ("16:9", 16, 9),
+    ("4:3", 4, 3),
+    ("1:1", 1, 1),
+    ("3:4", 3, 4),
+    ("9:16", 9, 16),
 ]
-# CLIP loader "type" values. Single-encoder uses CLIPLoader types; dual uses
-# DualCLIPLoader types.
-CLIP_TYPES_SINGLE = [
-    "stable_diffusion", "sd3", "flux", "stable_cascade", "mochi",
-    "ltxv", "pixart", "cosmos", "lumina2", "hidream", "chroma",
-    # Qwen-Image family. krea2 = Krea-2 (Qwen3-VL text encoder).
-    "qwen_image", "krea2",
-]
-CLIP_TYPES_DUAL = ["sdxl", "sd3", "flux", "hunyuan_video", "hidream"]
+
+# 解像度の目安（メガピクセル）。1.0 ≒ 768p 標準、0.4 は軽量・高速。
+QUALITY_PRESETS = [("標準 (768p級)", 1.0), ("軽量 (0.4MP)", 0.4)]
+
+_SIZE_MULTIPLE = 32
 
 
-# Defaults tuned for anima (Qwen-Image based) per the reference workflow.
-DEFAULT_NEGATIVE = (
-    "worst quality, low quality, score_1, score_2, score_3, blurry, "
-    "jpeg artifacts, sepia"
-)
+def frames_for_seconds(seconds: float) -> int:
+    """秒数を 24fps・17n+5 グリッドのフレーム数へスナップ（公式テンプレの式）。"""
+    f = max(5, round(seconds * FPS))
+    return f + (5 - (f % 17)) % 17
+
+
+def size_for_aspect(aw: int, ah: int, megapixels: float) -> tuple[int, int]:
+    """アスペクト比と目標画素数から 32 の倍数の (width, height) を求める。
+
+    公式テンプレの ResolutionSelector と同じく幅を先に丸め、高さは丸めた幅
+    から従属して丸める（16:9 1.0MP → 1344x768、0.2MP → 608x352 に一致）。
+    """
+    ratio = aw / ah
+    w = math.sqrt(megapixels * 1_000_000 * ratio)
+    w = max(_SIZE_MULTIPLE, round(w / _SIZE_MULTIPLE) * _SIZE_MULTIPLE)
+    h = max(_SIZE_MULTIPLE, round(w / ratio / _SIZE_MULTIPLE) * _SIZE_MULTIPLE)
+    return int(w), int(h)
+
+
+def size_for_image(img_w: int, img_h: int, megapixels: float) -> tuple[int, int]:
+    """入力画像のアスペクト比を保ったまま目標画素数へ（i2v 用）。"""
+    return size_for_aspect(img_w, img_h, megapixels)
 
 
 @dataclass
 class GenParams:
-    diffusion: str
-    vae: str
-    # True when ``diffusion`` is a full checkpoint (bundling VAE+CLIP): it is
-    # loaded via CheckpointLoaderSimple and, when ``vae``/``te`` are empty, its
-    # built-in VAE / CLIP are used. False -> UNETLoader + separate VAE/CLIP.
-    checkpoint: bool = False
-    # Optional model merge: [(filename, weight), ...]. When non-empty the
-    # diffusion model comes from the ScomMergeModel custom node (weighted
-    # average materialized in RAM; see app/comfy_custom_nodes.py) and
-    # ``diffusion`` is ignored. Weights are relative (need not sum to 1).
-    # A single entry is just that model, optionally quantized, pinned in RAM.
-    merge_models: list[tuple[str, float]] = field(default_factory=list)
-    # Output precision of the merge: "" (bf16) | "fp8" | "int8_convrot"
-    # | "int4_convrot" (int4/int8 hybrid) | "int4_convrot_full" (all int4).
-    merge_quant: str = ""
-    # True: fold sources one at a time (low RAM); False: all at once (fp32).
-    merge_low_memory: bool = False
-    te: list[str] = field(default_factory=list)  # 1 -> CLIPLoader, 2 -> DualCLIPLoader
-    clip_type: str = "stable_diffusion"
-    # Applied LoRAs: [(filename under models/loras, strength), ...], chained
-    # in order. The strength is used for both model and clip weights.
-    loras: list[tuple[str, float]] = field(default_factory=list)
+    """1回の動画生成のスナップショット。
+
+    画像/動画/音声の参照ファイルは、事前に ComfyUI の input ディレクトリへ
+    アップロード済みの名前（LoadImage/LoadVideo/LoadAudio が読める形）で持つ。
+    """
+    mode: str = "t2v"            # t2v | i2v | r2v
+    diffusion: str = ""          # fl2va (t2v/i2v) / ref2va (r2v) のファイル名
+    te: str = ""
+    vae_video: str = ""
+    vae_audio: str = ""
     prompt: str = ""
-    negative: str = ""
-    width: int = 1024
-    height: int = 1024
-    steps: int = 30
-    cfg: float = 4.0
-    sampler: str = "er_sde"
+    width: int = 1344
+    height: int = 768
+    frames: int = 124            # 24fps・17n+5 グリッド（124 ≒ 5秒）
+    steps: int = 20
+    sampler: str = "res_multistep"
     scheduler: str = "simple"
     seed: int = 0
-    batch_size: int = 1
-    weight_dtype: str = "default"  # default | fp8_e4m3fn | fp8_e5m2
-    filename_prefix: str = "scom"
-    # Hires fix (latent): 1段目の latent を補間拡大し、同じモデル/プロンプトで
-    # 2段目の KSampler を denoise<1 で回して細部を描き直す。
-    hires_enabled: bool = False
-    hires_scale: float = 1.5
-    hires_denoise: float = 0.55
-    hires_steps: int = 0            # 0 = メインの steps と同じ
-    hires_method: str = "bislerp"   # LatentUpscaleBy の補間方法
-
-
-# Quantization choices for the merged model (node input "quantize").
-MERGE_QUANT_MODES = ("", "fp8", "int8_convrot", "int4_convrot",
-                     "int4_convrot_full")
-
-
-def _validate_merge(merge_models: list[tuple[str, float]],
-                    quant: str = "") -> None:
-    # A single model is allowed: the "merge" is then just (optionally
-    # quantized) materialization of that model into backend RAM.
-    if len(merge_models) < 1:
-        raise ValueError("マージには1個以上のモデルが必要です")
-    for name, w in merge_models:
-        if not name:
-            raise ValueError("マージ対象のモデル名が空です")
-        if w <= 0:
-            raise ValueError(f"マージ比率は正の数値が必要です: {name} = {w}")
-    if quant not in MERGE_QUANT_MODES:
-        raise ValueError(f"不明な量子化形式です: {quant}")
-
-
-def merge_recipe(merge_models: list[tuple[str, float]]) -> str:
-    """The merge node's recipe input. A stable string matters: both ComfyUI's
-    output cache and the node's own pin cache key on it, so an identical
-    config reuses the merged model already sitting in RAM."""
-    return json.dumps([[n, float(w)] for n, w in merge_models])
-
-
-def merge_pin_key(merge_models: list[tuple[str, float]], quant: str,
-                  low_memory: bool) -> str:
-    """Key of the backend pin cache entry (must mirror the node's _pin_key)."""
-    return json.dumps([merge_recipe(merge_models), quant, bool(low_memory)])
-
-
-def _merge_node(merge_models: list[tuple[str, float]], quant: str,
-                low_memory: bool, save_to: str = "") -> dict:
-    return {
-        "class_type": "ScomMergeModel",
-        "inputs": {"recipe": merge_recipe(merge_models), "quantize": quant,
-                   "low_memory": bool(low_memory), "save_to": save_to},
-    }
-
-
-def build_merge_graph(merge_models: list[tuple[str, float]], quant: str = "",
-                      low_memory: bool = False, save_to: str = "") -> dict:
-    """Merge-only prompt: build (or refresh) the merged model in backend RAM.
-
-    With ``save_to`` the merged model is also written to the diffusion_models
-    folder as a safetensors file. The node id matches build_graph's diffusion
-    node, so a following generation with the same config is a cache hit.
-    """
-    _validate_merge(merge_models, quant)
-    return {"4": _merge_node(merge_models, quant, low_memory, save_to)}
+    weight_dtype: str = "default"  # UNETLoader の読み込み精度
+    # Sigma shift（OFF ならノード自体を入れずモデル既定に任せる）
+    shift_enabled: bool = False
+    shift_video: float = 12.0
+    shift_audio: float = 3.0
+    # i2v: 開始/終端フレーム（アップロード済み画像名。空 = 未指定）
+    first_frame: str = ""
+    last_frame: str = ""
+    # r2v: 参照（アップロード済みファイル名）
+    ref_image_size: str = "match"
+    ref_images: list[str] = field(default_factory=list)   # 最大9
+    # [{"name": <video file>, "use_audio": bool}] 最大3
+    ref_videos: list[dict] = field(default_factory=list)
+    ref_audios: list[str] = field(default_factory=list)   # 最大3
+    filename_prefix: str = "video/scomv"
 
 
 def build_graph(p: GenParams) -> dict:
     """Return a ComfyUI API-format prompt graph for the given parameters."""
-    merging = len(p.merge_models) >= 1
-    ckpt = p.checkpoint and not merging   # full checkpoint w/ built-in VAE+CLIP
-    if not merging and not p.diffusion:
-        raise ValueError("diffusion model is required")
-    # A full checkpoint supplies VAE/CLIP itself, so they may be empty. A
-    # UNet-only diffusion (anima/krea2 等) still requires them.
-    if not ckpt:
-        if not p.vae:
-            raise ValueError("vae model is required")
-        if not p.te:
-            raise ValueError("at least one text encoder (te) is required")
+    if not p.diffusion:
+        raise ValueError("diffusion モデルを選択してください")
+    if not p.te:
+        raise ValueError("text encoder を選択してください")
+    if not p.vae_video:
+        raise ValueError("動画 VAE を選択してください")
+    if not p.vae_audio:
+        raise ValueError("音声 VAE を選択してください")
+    if p.mode not in ("t2v", "i2v", "r2v"):
+        raise ValueError(f"不明なモードです: {p.mode}")
+    if p.mode == "i2v" and not p.first_frame and not p.last_frame:
+        raise ValueError("i2v には開始フレーム（または終端フレーム）画像が必要です")
+    if p.mode == "r2v" and not (p.ref_images or p.ref_videos or p.ref_audios):
+        raise ValueError("r2v には参照（画像/動画/音声）が1つ以上必要です")
 
-    graph: dict[str, dict] = {}
+    g: dict[str, dict] = {}
+    g["1"] = {"class_type": "UNETLoader",
+              "inputs": {"unet_name": p.diffusion,
+                         "weight_dtype": p.weight_dtype}}
+    g["2"] = {"class_type": "CLIPLoader",
+              "inputs": {"clip_name": p.te, "type": "minimax",
+                         "device": "default"}}
+    g["3"] = {"class_type": "VAELoader", "inputs": {"vae_name": p.vae_video}}
+    g["4"] = {"class_type": "VAELoader", "inputs": {"vae_name": p.vae_audio}}
 
-    # Node "4": the model source. CheckpointLoaderSimple outputs
-    # (MODEL=0, CLIP=1, VAE=2); UNETLoader / merge output MODEL=0 only.
-    clip_builtin = vae_builtin = None
-    if merging:
-        _validate_merge(p.merge_models, p.merge_quant)
-        graph["4"] = _merge_node(p.merge_models, p.merge_quant,
-                                 p.merge_low_memory)
-    elif ckpt:
-        graph["4"] = {
-            "class_type": "CheckpointLoaderSimple",
-            "inputs": {"ckpt_name": p.diffusion},
-        }
-        clip_builtin = ["4", 1]
-        vae_builtin = ["4", 2]
-    else:
-        graph["4"] = {
-            "class_type": "UNETLoader",
-            "inputs": {"unet_name": p.diffusion, "weight_dtype": p.weight_dtype},
-        }
+    model_src: list = ["1", 0]
+    if p.shift_enabled:
+        g["6"] = {"class_type": "MiniMaxH3SigmaShift",
+                  "inputs": {"model": model_src,
+                             "shift_video": float(p.shift_video),
+                             "shift_audio": float(p.shift_audio)}}
+        model_src = ["6", 0]
 
-    # VAE: explicit VAELoader when a file is given, else the checkpoint's built-in.
-    if p.vae:
-        graph["5"] = {"class_type": "VAELoader", "inputs": {"vae_name": p.vae}}
-        vae_src: list = ["5", 0]
-    else:
-        vae_src = vae_builtin
+    # ----- conditioning + AV latent ---------------------------------------
+    if p.mode in ("t2v", "i2v"):
+        inputs = {
+            "clip": ["2", 0],
+            "vae": ["3", 0],
+            "prompt": p.prompt,
+            "width": int(p.width),
+            "height": int(p.height),
+            "length": int(p.frames),
+        }
+        nid = 20
+        if p.first_frame:
+            g[str(nid)] = {"class_type": "LoadImage",
+                           "inputs": {"image": p.first_frame}}
+            inputs["first_frame"] = [str(nid), 0]
+            nid += 1
+        if p.last_frame:
+            g[str(nid)] = {"class_type": "LoadImage",
+                           "inputs": {"image": p.last_frame}}
+            inputs["last_frame"] = [str(nid), 0]
+            nid += 1
+        g["5"] = {"class_type": "MiniMaxH3ImageToVideo", "inputs": inputs}
+    else:  # r2v
+        if len(p.ref_images) > 9:
+            raise ValueError("参照画像は最大9枚です")
+        if len(p.ref_videos) > 3:
+            raise ValueError("参照動画は最大3本です")
+        if len(p.ref_audios) > 3:
+            raise ValueError("参照音声は最大3本です")
+        inputs = {
+            "clip": ["2", 0],
+            "vae": ["3", 0],
+            "audio_vae": ["4", 0],
+            "prompt": p.prompt,
+            "width": int(p.width),
+            "height": int(p.height),
+            "length": int(p.frames),
+            "ref_image_size": p.ref_image_size,
+        }
+        nid = 20
+        for i, name in enumerate(p.ref_images, start=1):
+            g[str(nid)] = {"class_type": "LoadImage",
+                           "inputs": {"image": name}}
+            inputs[f"ref_image_{i}"] = [str(nid), 0]
+            nid += 1
+        for i, rv in enumerate(p.ref_videos, start=1):
+            load_id = str(nid); nid += 1
+            comp_id = str(nid); nid += 1
+            g[load_id] = {"class_type": "LoadVideo",
+                          "inputs": {"file": rv["name"]}}
+            g[comp_id] = {"class_type": "GetVideoComponents",
+                          "inputs": {"video": [load_id, 0]}}
+            inputs[f"ref_video_{i}"] = [comp_id, 0]
+            if rv.get("use_audio"):
+                inputs[f"ref_video_audio_{i}"] = [comp_id, 1]
+        for i, name in enumerate(p.ref_audios, start=1):
+            g[str(nid)] = {"class_type": "LoadAudio",
+                           "inputs": {"audio": name}}
+            inputs[f"ref_audio_{i}"] = [str(nid), 0]
+            nid += 1
+        g["5"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": inputs}
 
-    # CLIP: explicit (Dual)CLIPLoader when TEs are given, else the built-in.
-    if len(p.te) >= 2:
-        graph["6"] = {
-            "class_type": "DualCLIPLoader",
-            "inputs": {
-                "clip_name1": p.te[0],
-                "clip_name2": p.te[1],
-                "type": p.clip_type,
-            },
-        }
-        clip_src: list = ["6", 0]
-    elif len(p.te) == 1:
-        graph["6"] = {
-            "class_type": "CLIPLoader",
-            "inputs": {"clip_name": p.te[0], "type": p.clip_type},
-        }
-        clip_src = ["6", 0]
-    else:
-        clip_src = clip_builtin
+    # ----- sampling (CFG 無し: BasicGuider) --------------------------------
+    g["7"] = {"class_type": "RandomNoise", "inputs": {"noise_seed": p.seed}}
+    g["8"] = {"class_type": "KSamplerSelect",
+              "inputs": {"sampler_name": p.sampler}}
+    g["9"] = {"class_type": "BasicScheduler",
+              "inputs": {"model": model_src, "scheduler": p.scheduler,
+                         "steps": int(p.steps), "denoise": 1.0}}
+    g["10"] = {"class_type": "BasicGuider",
+               "inputs": {"model": model_src, "conditioning": ["5", 0]}}
+    g["11"] = {"class_type": "SamplerCustomAdvanced",
+               "inputs": {"noise": ["7", 0], "guider": ["10", 0],
+                          "sampler": ["8", 0], "sigmas": ["9", 0],
+                          "latent_image": ["5", 1]}}
 
-    # LoRA chain: model/clip flow through LoraLoader nodes in applied order.
-    # Node ids start at 20 to stay clear of the fixed 4-12 range.
-    model_src: list = ["4", 0]
-    for i, (lora_name, strength) in enumerate(p.loras):
-        if not lora_name:
-            raise ValueError("LoRA のファイル名が空です")
-        nid = str(20 + i)
-        graph[nid] = {
-            "class_type": "LoraLoader",
-            "inputs": {
-                "lora_name": lora_name,
-                "strength_model": float(strength),
-                "strength_clip": float(strength),
-                "model": model_src,
-                "clip": clip_src,
-            },
-        }
-        model_src = [nid, 0]
-        clip_src = [nid, 1]
-
-    graph["7"] = {
-        "class_type": "CLIPTextEncode",
-        "inputs": {"text": p.prompt, "clip": clip_src},
-    }
-    graph["8"] = {
-        "class_type": "CLIPTextEncode",
-        "inputs": {"text": p.negative, "clip": clip_src},
-    }
-    graph["9"] = {
-        "class_type": "EmptyLatentImage",
-        "inputs": {
-            "width": p.width,
-            "height": p.height,
-            "batch_size": p.batch_size,
-        },
-    }
-    graph["10"] = {
-        "class_type": "KSampler",
-        "inputs": {
-            "seed": p.seed,
-            "steps": p.steps,
-            "cfg": p.cfg,
-            "sampler_name": p.sampler,
-            "scheduler": p.scheduler,
-            "denoise": 1.0,
-            "model": model_src,
-            "positive": ["7", 0],
-            "negative": ["8", 0],
-            "latent_image": ["9", 0],
-        },
-    }
-    samples_src: list = ["10", 0]
-    if p.hires_enabled and p.hires_scale > 1.0:
-        # Hires fix (latent): 補間拡大 → 2段目サンプリング。seed は1段目と
-        # 同じ（WebUI の hires fix と同じ流儀）。
-        graph["13"] = {
-            "class_type": "LatentUpscaleBy",
-            "inputs": {
-                "samples": ["10", 0],
-                "upscale_method": p.hires_method,
-                "scale_by": float(p.hires_scale),
-            },
-        }
-        graph["14"] = {
-            "class_type": "KSampler",
-            "inputs": {
-                "seed": p.seed,
-                "steps": int(p.hires_steps) if p.hires_steps > 0 else p.steps,
-                "cfg": p.cfg,
-                "sampler_name": p.sampler,
-                "scheduler": p.scheduler,
-                "denoise": float(p.hires_denoise),
-                "model": model_src,
-                "positive": ["7", 0],
-                "negative": ["8", 0],
-                "latent_image": ["13", 0],
-            },
-        }
-        samples_src = ["14", 0]
-
-    graph["11"] = {
-        "class_type": "VAEDecode",
-        "inputs": {"samples": samples_src, "vae": vae_src},
-    }
-    # PreviewImage writes to ComfyUI's temp dir (throwaway). The app saves the
-    # real, format/quality-controlled file to output/ from the returned bytes.
-    graph["12"] = {
-        "class_type": "PreviewImage",
-        "inputs": {"images": ["11", 0]},
-    }
-    return graph
+    # ----- decode + mux + save --------------------------------------------
+    g["12"] = {"class_type": "VAEDecode",
+               "inputs": {"samples": ["11", 0], "vae": ["3", 0]}}
+    g["13"] = {"class_type": "VAEDecodeAudio",
+               "inputs": {"samples": ["11", 0], "vae": ["4", 0]}}
+    g["14"] = {"class_type": "CreateVideo",
+               "inputs": {"images": ["12", 0], "fps": float(FPS),
+                          "audio": ["13", 0], "bit_depth": 8}}
+    g["15"] = {"class_type": "SaveVideo",
+               "inputs": {"video": ["14", 0],
+                          "filename_prefix": p.filename_prefix,
+                          "format": "auto", "codec": {"codec": "auto"}}}
+    return g

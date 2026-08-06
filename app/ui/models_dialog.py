@@ -82,7 +82,7 @@ class ModelsDialog(QDialog):
     def __init__(self, paths: config.AppPaths, sage_enabled: bool = False,
                  parent=None):
         super().__init__(parent)
-        self.setWindowTitle("scom - 設定")
+        self.setWindowTitle("scom-v - 設定")
         self.resize(720, 560)
         bind_geometry(self, "models")
         self._paths = paths

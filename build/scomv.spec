@@ -1,13 +1,13 @@
-# PyInstaller spec for scom — single-file (onefile) release build.
+# PyInstaller spec for scom-v — single-file (onefile) release build.
 #
 # The heavy ML stack (PyTorch, ComfyUI, the models) is downloaded at first run,
 # so the exe bundles only Python + PySide6 + the app. Copying the single
-# dist/scom.exe to a fresh machine is enough; on first launch it provisions the
+# dist/scom-v.exe to a fresh machine is enough; on first launch it provisions the
 # backend and downloads the chosen models next to the exe.
 #
 # Build from the repo root:
-#   pyinstaller build/scom.spec --clean --noconfirm
-# Output: dist/scom.exe
+#   pyinstaller build/scomv.spec --clean --noconfirm
+# Output: dist/scom-v.exe
 import os
 
 # SPECPATH is the directory holding this spec (…/scom/build); its parent is the
@@ -29,11 +29,11 @@ _EXCLUDES = [
 ]
 
 a = Analysis(
-    [os.path.join(ROOT, "scom.py")],
+    [os.path.join(ROOT, "scomv.py")],
     pathex=[ROOT],
     binaries=[],
     datas=[],
-    hiddenimports=["websocket", "piexif", "PIL", "tomli"],
+    hiddenimports=["websocket", "tomli"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -48,7 +48,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="scom",
+    name="scom-v",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

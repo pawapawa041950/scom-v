@@ -1,4 +1,4 @@
-# Dev launcher for scom.
+# Dev launcher for scom-v.
 # 1. Creates/activates a local venv (for the GUI only)
 # 2. Installs GUI deps (PySide6, websocket-client)
 # 3. Runs the app from source
@@ -20,4 +20,4 @@ if (-not (Test-Path ".\.venv")) {
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 
-python scom.py
+python scomv.py

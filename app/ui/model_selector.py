@@ -19,25 +19,26 @@ from .. import config
 from ..bootstrap import models as models_mod
 
 # Quick-select presets: which files a button ticks for a given setup.
-PRESET_ANIMA = [
-    "anima-base-v1.0.safetensors",
-    "qwen_image_vae.safetensors",
-    "qwen_3_06b_base.safetensors",
+# 共通ファイル（TE / 動画VAE / 音声VAE）は各セットに含め、OR 選択の既存機構で
+# 重複ダウンロードを避ける。量子化は int8_convrot / fp8_scaled の選択制。
+_SHARED = [
+    "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+    "minimax_h3_video_vae_fp16.safetensors",
+    "minimax_h3_audio_vae_fp32.safetensors",
 ]
-PRESET_KREA2 = [
-    "krea2_turbo_int8_convrot.safetensors",
-    "qwen_image_vae.safetensors",
-    "qwen3vl_4b_fp8_scaled.safetensors",
-]
-# WAI はフル SDXL チェックポイント（VAE/CLIP 内蔵）なので本体のみ。VAE/CLIP は
-# モデル内蔵を使うため別途ダウンロードしない。
-PRESET_SDXL = [
-    "waiIllustriousSDXL_v170.safetensors",
-]
+PRESET_CORE_INT8 = [
+    "minimax_h3_fl2va_pruned_int8_convrot.safetensors", *_SHARED]
+PRESET_CORE_FP8 = [
+    "minimax_h3_fl2va_pruned_fp8_scaled.safetensors", *_SHARED]
+PRESET_R2V_INT8 = [
+    "minimax_h3_ref2va_pruned_int8_convrot.safetensors", *_SHARED]
+PRESET_R2V_FP8 = [
+    "minimax_h3_ref2va_pruned_fp8_scaled.safetensors", *_SHARED]
 QUICK_PRESETS = [
-    ("Anima 必須モデル", PRESET_ANIMA),
-    ("Krea2 必須モデル int8convrot", PRESET_KREA2),
-    ("SDXL WAI-illustrious-SDXL 必須モデル", PRESET_SDXL),
+    ("t2v / i2v 必須セット (int8_convrot)", PRESET_CORE_INT8),
+    ("t2v / i2v 必須セット (fp8_scaled)", PRESET_CORE_FP8),
+    ("r2v 追加セット (int8_convrot)", PRESET_R2V_INT8),
+    ("r2v 追加セット (fp8_scaled)", PRESET_R2V_FP8),
 ]
 
 

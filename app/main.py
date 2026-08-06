@@ -14,7 +14,7 @@ from .ui.widgets import CompactSpinStyle
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName("scom")
+    app.setApplicationName("scom-v")
     # Wraps the platform default style (windows11 on Windows 11).
     app.setStyle(CompactSpinStyle())
 

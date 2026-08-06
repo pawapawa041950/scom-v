@@ -1,8 +1,8 @@
 """Persisted UI settings (TOML).
 
 All settings are auto-saved whenever the user changes a control. The startup
-prompt/negative are NOT stored here — they come from the first entry of
-prompts.csv. The file lives next to the executable so it is easy to edit.
+prompt is NOT stored here — it comes from the first entry of prompts.csv. The
+file lives next to the executable so it is easy to edit.
 """
 from __future__ import annotations
 
@@ -15,52 +15,33 @@ except ModuleNotFoundError:  # Python 3.10
     import tomli as _toml  # type: ignore
 
 DEFAULTS: dict[str, Any] = {
-    # models
-    "preset": "",      # anima | krea2 | sdxl (空/旧 "all" は起動時に移行)
-    # 表示モデルごとの Models + 設定カテゴリの記憶 (JSON {preset: {...}})
-    "preset_conf": "{}",
-    "diffusion": "",
-    "vae": "",
-    "te1": "",
-    "te2": "",
-    "dual_te": False,
-    "clip_type": "stable_diffusion",
-    # Model merges: JSON list of entries, each
-    #   {"id": int, "name": str, "models": [["file", weight], ...],
-    #    "quant": ""|"fp8"|"int8_convrot", "low_memory": bool}
-    # merge_seq is the last id handed out (numbering never reuses ids).
-    "merges": "[]",
-    "merge_seq": 0,
-    # NOTE: 適用中の LoRA は意図的に永続化しない（毎回まっさらで起動）。
-    # SageAttention（量子化attentionによる高速化）を使うか。ONでもパッケージ
-    # 未導入なら起動フラグは付けない（バックエンドが起動不能になるため）。
-    "sage_attention": False,
-    # Hires fix (latent): 2段目サンプリングによる高解像度化
-    "hires_enabled": False,
-    "hires_scale": 1.5,
-    "hires_denoise": 0.55,
-    "hires_steps": 0,          # 0 = メインの steps と同じ
-    "hires_method": "bislerp",
+    # mode: t2v | i2v | r2v
+    "mode": "t2v",
+    # models（ファイル名。空 = 再スキャン時に自動選択）
+    "diffusion_fl2va": "",
+    "diffusion_ref2va": "",
+    "te": "",
+    "vae_video": "",
+    "vae_audio": "",
     # generation settings
-    "width": 1024,
-    "height": 1024,
-    "steps": 30,
-    "cfg": 4.0,
-    "batch": 1,
-    "sampler": "er_sde",
+    "aspect": "16:9",
+    "quality_mp": 1.0,       # 目標メガピクセル（1.0 ≒ 768p級）
+    "length_sec": 5.0,       # 動画の長さ（秒。17n+5 フレームへスナップ）
+    "steps": 20,
+    "sampler": "res_multistep",
     "scheduler": "simple",
-    # seed 欄の値（"-1" = 毎回ランダム）。生成後の書き戻しは無いので、
-    # 保存されるのはユーザーが欄に入力した値そのもの。
+    # seed 欄の値（"-1" = 毎回ランダム）。生成後の書き戻しは無い。
     "seed": "-1",
     "dtype": "default",
-    # image output
-    "image_format": "png",   # png | jpg | webp
-    "png_compress": 6,       # 0..9
-    "jpg_quality": 92,       # 1..100
-    "webp_quality": 90,      # 1..100
-    "embed_metadata": True,  # 画像にメタ情報（parameters/EXIF）を埋め込む
-    # XYZ プロットウィンドウの入力状態 (JSON)
-    "xyz": "{}",
+    # Sigma shift（OFF ならモデル既定）
+    "shift_enabled": False,
+    "shift_video": 12.0,
+    "shift_audio": 3.0,
+    # r2v
+    "ref_image_size": "match",
+    # SageAttention（量子化attentionによる高速化）。ONでもパッケージ未導入なら
+    # 起動フラグは付けない（バックエンドが起動不能になるため）。
+    "sage_attention": False,
 }
 
 
@@ -104,8 +85,8 @@ def save(path: Path, data: dict[str, Any]) -> None:
     再起動で消える、という分かりにくい不具合になる。
     """
     lines = [
-        "# scom 設定ファイル（変更すると自動保存されます）。",
-        "# 起動時のプロンプト/ネガティブは prompts.csv の1個目の設定から読み込まれます。",
+        "# scom-v 設定ファイル（変更すると自動保存されます）。",
+        "# 起動時のプロンプトは prompts.csv の1個目の設定から読み込まれます。",
         "",
     ]
     for key in DEFAULTS:
