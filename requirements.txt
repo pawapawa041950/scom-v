@@ -1,0 +1,7 @@
+# scom GUI dependencies (the generation backend, ComfyUI + torch, is installed
+# separately — see README "Backend setup").
+PySide6>=6.6
+websocket-client>=1.7
+tomli>=2.0 ; python_version < "3.11"
+Pillow>=10.0      # save images + embed metadata (PNG text / JPEG-WEBP EXIF)
+piexif>=1.1       # build EXIF UserComment for JPEG/WEBP

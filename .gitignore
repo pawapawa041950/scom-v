@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts (PyInstaller) — keep only the spec
+build/*
+!build/scom.spec
+dist/
+
+# Local app data (created at runtime; may contain personal prompts/outputs)
+userdata/
+output/
+settings.toml
+prompts.csv
+
+# Downloaded / vendored ComfyUI backend
+vendor/
+
+# Model weights — never commit (large + licensed). Keep the empty dir markers.
+models/diffusion_models/*
+models/vae/*
+models/text_encoders/*
+!models/**/.gitkeep
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.gguf
+*.bin
+*.sft
+*.onnx
+
+# Local Claude Code config (permission allowlist etc.) — do not publish
+.claude/settings.local.json
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.log
+*.swp

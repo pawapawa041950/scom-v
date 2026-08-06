@@ -1,0 +1,10 @@
+# 改行コードは LF に統一する（Windows でもチェックアウト時に CRLF へ
+# 変換しない）。エディタ側も .editorconfig 等で LF を維持すること。
+* text=auto eol=lf
+
+# バイナリは変換対象外
+*.png binary
+*.jpg binary
+*.webp binary
+*.ico binary
+*.safetensors binary
