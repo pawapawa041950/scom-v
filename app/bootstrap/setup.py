@@ -27,14 +27,15 @@ LogCb = Callable[[str], None]
 # Pin ComfyUI to a specific release tag for reproducible installs. The short
 # /archive/<ref>.zip form resolves tags, branches, and commit SHAs alike, so
 # SCOM_COMFYUI_REF can be overridden with any of them (e.g. "master").
-# v0.30.0 (2026-08-03): MiniMax-H3 ネイティブ対応（scom-v の前提バージョン）。
-COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF", "v0.30.0")
+# v0.31.0 (2026-08-08): MiniMax-H3 の修正多数（EasyCache音声破損修正・
+# noise maskサンプリング修正・int8_convrot VAE対応・audio VAEオフロード修正）。
+COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF", "v0.31.0")
 COMFYUI_ZIP = f"https://github.com/comfyanonymous/ComfyUI/archive/{COMFYUI_REF}.zip"
 
 # Bump when a newer ComfyUI is required. Changing this re-fetches ComfyUI and
 # reinstalls its deps on machines that were provisioned with an older copy.
 # Tied to the pinned ref so the provisioned version is self-documenting.
-COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "v0.30.0")
+COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "v0.31.0")
 
 # Fixed (non-model) steps, in order: (step_id, title).
 # Technical names (uv / PyTorch / ComfyUI) are kept in English by request.

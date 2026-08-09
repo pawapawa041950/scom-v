@@ -53,6 +53,7 @@ def write_extra_model_paths(paths: config.AppPaths) -> Path:
         "  diffusion_models: diffusion_models/\n"
         "  vae: vae/\n"
         "  text_encoders: text_encoders/\n"
+        "  loras: loras/\n"
     )
     out = paths.user_data / "extra_model_paths.yaml"
     out.write_text(yaml_text, encoding="utf-8")

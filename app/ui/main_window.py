@@ -7,12 +7,14 @@ from typing import Optional
 
 from PySide6.QtCore import (
     Qt, QThread, Signal, QObject, QRegularExpression, QTimer, QEvent, QUrl,
+    QPoint,
 )
 from PySide6.QtGui import (
-    QDesktopServices, QImage, QPixmap, QRegularExpressionValidator,
+    QColor, QCursor, QDesktopServices, QImage, QPixmap,
+    QRegularExpressionValidator, QTextCharFormat, QTextCursor, QTextFormat,
 )
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
     QPushButton, QSizePolicy, QSpinBox, QSplitter, QStackedWidget,
@@ -20,8 +22,15 @@ from PySide6.QtWidgets import (
 )
 
 from .. import config, settings, prompt_presets, workflow
+from .. import lora as lora_meta
 from . import ansi_log
-from .widgets import GrowingTextEdit, WideComboBox
+from .widgets import (
+    FlowLayout, GrowingTextEdit, PlaceholderListWidget, WideComboBox,
+)
+from ..bootstrap import environment
+from ..bootstrap.setup import (
+    SetupError, install_sage_attention, sage_installed, _Manifest,
+)
 from ..comfy_backend import ComfyBackend, BackendError, Progress
 from ..workflow import (
     GenParams, build_graph, frames_for_seconds, size_for_aspect,
@@ -29,6 +38,14 @@ from ..workflow import (
 )
 
 MAX_SEED = 2**63 - 1
+
+# LoRA トリガーワードをプロンプト欄に挿入したときの区別用マーキング。
+# 挿入した文字範囲に専用の文字書式（背景色 + token プロパティ）を付け、
+# 見た目と区間追跡の両方で元のプロンプトと区別する。token を持つ区間は
+# ユーザーが編集しても書式が残るので、編集後のワードごとまとめて削除できる。
+_LORA_TOKEN_PROP = QTextFormat.UserProperty + 17
+_LORA_INSERT_BG = QColor("#e7edf5")   # 明るい背景
+_LORA_INSERT_FG = QColor("#22456e")   # 濃い文字色
 
 MODES = [("t2v", "テキストから動画 (t2v)"),
          ("i2v", "画像から動画 (i2v)"),
@@ -38,6 +55,30 @@ _IMAGE_FILTER = "画像 (*.png *.jpg *.jpeg *.webp *.bmp);;すべて (*.*)"
 _VIDEO_FILTER = "動画 (*.mp4 *.webm *.mkv *.mov *.avi);;すべて (*.*)"
 _AUDIO_FILTER = "音声 (*.wav *.mp3 *.flac *.ogg *.m4a);;すべて (*.*)"
 _VIDEO_EXTS = (".mp4", ".webm", ".mkv", ".mov", ".avi")
+
+
+# SageAttention インストールジョブ（親なしスレッド）の生存参照。UI 側の
+# 状態に関係なくインストールを完走させるために保持する。
+_SAGE_JOBS: list = []
+
+
+class _SageInstallWorker(QObject):
+    log = Signal(str)
+    done = Signal()
+    failed = Signal(str)
+
+    def __init__(self, paths: config.AppPaths):
+        super().__init__()
+        self.paths = paths
+
+    def run(self) -> None:
+        try:
+            install_sage_attention(self.paths, self.log.emit)
+            self.done.emit()
+        except SetupError as e:
+            self.failed.emit(str(e))
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
 
 
 class _StartWorker(QObject):
@@ -96,7 +137,6 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("scom-v - 動画生成")
-        self.resize(1180, 760)
 
         self.paths = config.AppPaths()
         self.backend = ComfyBackend(self.paths)
@@ -113,6 +153,17 @@ class MainWindow(QMainWindow):
         # 同じ参照ファイルを毎回アップロードし直さないため。
         self._upload_cache: dict[str, tuple[float, str]] = {}
         self._all_models: dict[str, list[str]] = {}
+        # 適用中 LoRA（チェックポイント別に記憶: fl2va = t2v/i2v, ref2va = r2v。
+        # scom と同様、アプリ再起動では保存しない）。
+        self._loras_by_family: dict[str, list[dict]] = {
+            "fl2va": [], "ref2va": []}
+        self._lora_dlg = None            # 非モーダル LoraDialog（最大1個）
+        self._lora_popup = None          # チップホバーのポップアップ（遅延生成）
+        self._lora_pop_anchor = None
+        self._lora_pop_timer = QTimer(self)
+        self._lora_pop_timer.setSingleShot(True)
+        self._lora_pop_timer.setInterval(220)   # 離脱後この時間で閉じる
+        self._lora_pop_timer.timeout.connect(self._hide_lora_popup)
 
         self.settings, settings_error = settings.load(self.paths.settings_path)
         self._loading = True
@@ -122,6 +173,9 @@ class MainWindow(QMainWindow):
         self._save_timer.timeout.connect(self._do_save)
 
         self._build_ui()
+        # 既定サイズ（settings.py の window_size 既定と同値）。保存済みの
+        # window_size / pane_sizes があれば _apply_settings で上書き復元される。
+        self.resize(1209, 675)
         self.refresh_models()
         self._reload_prompt_presets(quiet=True)
         self._apply_settings()
@@ -146,26 +200,23 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         splitter = QSplitter(Qt.Horizontal)
 
-        left = QWidget()
-        lv = QVBoxLayout(left)
+        # 3ペイン構成: 左（モード/Models/高速化/参照入力)・中央（設定/Prompt)・
+        # 右（ログ/プレビュー）。それぞれスプリッターで幅を調整できる。
+        pane_left = QWidget()
+        lv = QVBoxLayout(pane_left)
+        pane_center = QWidget()
+        cv = QVBoxLayout(pane_center)
 
-        # モード + 管理ボタン
-        top_row = QHBoxLayout()
-        top_row.addWidget(QLabel("モード:"))
+        # モード（左ペイン上部に配置。addLayout は後段の cell_lt で行う）
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("モード:"))
         self.cb_mode = WideComboBox()
         for token, label in MODES:
             self.cb_mode.addItem(label, token)
         self.cb_mode.currentIndexChanged.connect(self._on_mode_changed)
-        top_row.addWidget(self.cb_mode, stretch=1)
-        btn_rescan = QPushButton("再スキャン")
-        btn_rescan.clicked.connect(self.refresh_models)
-        btn_manage = QPushButton("設定…")
-        btn_manage.clicked.connect(self.open_models_dialog)
-        top_row.addWidget(btn_rescan)
-        top_row.addWidget(btn_manage)
-        lv.addLayout(top_row)
+        mode_row.addWidget(self.cb_mode, stretch=1)
 
-        # Models
+        # Models（左ペイン）
         box_models = QGroupBox("Models")
         form = QFormLayout(box_models)
         self.cb_diffusion = WideComboBox()
@@ -177,17 +228,47 @@ class MainWindow(QMainWindow):
         form.addRow("Text encoder:", self.cb_te)
         form.addRow("動画 VAE:", self.cb_vae_video)
         form.addRow("音声 VAE:", self.cb_vae_audio)
-        lv.addWidget(box_models)
+        # 再スキャン / 設定… は Models の末尾に置く
+        btn_rescan = QPushButton("再スキャン")
+        btn_rescan.clicked.connect(self.refresh_models)
+        btn_manage = QPushButton("設定…")
+        btn_manage.clicked.connect(self.open_models_dialog)
+        model_btns = QHBoxLayout()
+        model_btns.addStretch(1)
+        model_btns.addWidget(btn_rescan)
+        model_btns.addWidget(btn_manage)
+        form.addRow(model_btns)
 
-        # Prompt
+        # 左ペイン: モード行 → Models → 高速化設定
+        lv.addLayout(mode_row)
+        lv.addWidget(box_models)
+        lv.addWidget(self._build_speed_box())
+
+        # Prompt（中央ペイン下段）
         box_prompt = QGroupBox("Prompt")
         pv = QVBoxLayout(box_prompt)
-        self.txt_prompt = GrowingTextEdit(min_lines=5)
+        # 公式推奨のプロンプトは350〜500語と長くなるため、一定行数を超えたら
+        # スクロールバー表示に切り替えてウィンドウの肥大化を防ぐ。
+        self.txt_prompt = GrowingTextEdit(min_lines=5, max_lines=14)
         self.txt_prompt.setPlaceholderText(
             "動画の内容を文章で記述… (r2v では <Picture 1> <Video 1> <Audio 1> "
             "のタグで参照を指せます)")
         self.txt_prompt.installEventFilter(self)  # Shift+Enter で生成
         pv.addWidget(self.txt_prompt)
+        # ユーザーが挿入済みハイライトを手で消したときも LoRA 窓の表示を追従。
+        self.txt_prompt.textChanged.connect(self._push_lora_inserted)
+        # LoRA（選択ボタン + 適用中チップ）。
+        pv.addWidget(QLabel("LoRA"))
+        lora_row = QWidget()
+        self._lora_flow = FlowLayout(lora_row, hspacing=6, vspacing=4)
+        self._lora_flow.setContentsMargins(0, 0, 0, 0)
+        self.btn_lora = QPushButton("LoRA選択…")
+        self.btn_lora.setToolTip(
+            "LoRA の一覧（サムネイル・トリガーワード付き）を開いて"
+            "適用する LoRA を選びます")
+        self.btn_lora.clicked.connect(self._open_lora_dialog)
+        self._lora_flow.addWidget(self.btn_lora)
+        pv.addWidget(lora_row)
         preset_row = QHBoxLayout()
         self.cb_prompt_preset = WideComboBox()
         self.cb_prompt_preset.setToolTip(
@@ -204,19 +285,19 @@ class MainWindow(QMainWindow):
         preset_row.addWidget(btn_edit)
         preset_row.addWidget(btn_reload)
         pv.addLayout(preset_row)
-        lv.addWidget(box_prompt)
+        cv.addWidget(box_prompt)
+        cv.addStretch(1)
 
-        # モード別入力
+        # モード別入力（左ペイン下段: 参照/入力設定）
         self.stack_mode = QStackedWidget()
         self.stack_mode.addWidget(self._build_t2v_page())
         self.stack_mode.addWidget(self._build_i2v_page())
         self.stack_mode.addWidget(self._build_r2v_page())
         lv.addWidget(self.stack_mode)
-
-        # 設定
-        lv.addWidget(self._build_settings_box())
         lv.addStretch(1)
-        left.setMinimumWidth(560)
+
+        # 中央ペイン: 設定を最上部に置く（Prompt はその下）
+        cv.insertWidget(0, self._build_settings_box())
 
         # 右カラム: ログ / プレビュー / アクション
         right = QWidget()
@@ -228,9 +309,14 @@ class MainWindow(QMainWindow):
         ansi_log.style_log(self.log_view)
         rv.addWidget(self.log_view, stretch=1)
 
-        self.preview = QLabel("プレビュー\n（完成後はダブルクリックで動画を再生）")
+        # プレビュー: 生成中のフレーム静止画のみ表示する。動画の再生は
+        # 外部プレーヤーに任せる（アプリ内再生はファイルをロックするため廃止）。
+        self.preview = QLabel(
+            "プレビュー\n（生成中のフレームがここに表示されます。"
+            "ダブルクリック=外部プレーヤーで再生）")
+        # 【一時措置】ペイン調整のため最小サイズを緩和（元: 480x360）。
+        self.preview.setMinimumSize(80, 60)
         self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setMinimumSize(480, 360)
         self.preview.setStyleSheet(
             "QLabel { background:#1e1e1e; color:#888; border:1px solid #333; }")
         self.preview.installEventFilter(self)
@@ -258,9 +344,18 @@ class MainWindow(QMainWindow):
         act.addWidget(self.btn_cancel, stretch=1)
         rv.addLayout(act)
 
-        splitter.addWidget(left)
+        splitter.addWidget(pane_left)
+        splitter.addWidget(pane_center)
         splitter.addWidget(right)
-        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 1)
+        # ペインは内容の自然な最小幅を超えて自由に縮められるようにする
+        # （ドラッグ中の実サイズはステータスバーに表示）。
+        for p in (pane_left, pane_center, right):
+            p.setMinimumWidth(80)
+        splitter.splitterMoved.connect(
+            lambda *_a: self.status.showMessage(
+                f"ペイン幅 [左, 中央, 右] = {splitter.sizes()}"))
+        self.splitter = splitter
         self.setCentralWidget(splitter)
 
         self.progress = QProgressBar()
@@ -285,89 +380,125 @@ class MainWindow(QMainWindow):
         return page
 
     def _build_i2v_page(self) -> QWidget:
+        # 縦に余裕があるので「ラベル / パス欄（全幅）/ ボタン行」の3行構成に
+        # して、長いファイルパスが読めるようにする。
         page = QGroupBox("i2v 入力画像")
-        grid = QGridLayout(page)
+        v = QVBoxLayout(page)
         self.ed_first_frame = QLineEdit()
         self.ed_first_frame.setReadOnly(True)
         self.ed_last_frame = QLineEdit()
         self.ed_last_frame.setReadOnly(True)
-        for r, (label, ed, tip) in enumerate((
+        for i, (label, ed, tip) in enumerate((
             ("開始フレーム:", self.ed_first_frame,
              "動画の最初のフレームになる画像"),
             ("終端フレーム(任意):", self.ed_last_frame,
              "指定すると動画の最後がこの画像へ収束します（両方指定で補間的な生成）"),
         )):
+            if i:
+                v.addSpacing(8)
             ed.setToolTip(tip)
+            ed.setPlaceholderText("未選択")
+            lbl = QLabel(label)
+            lbl.setToolTip(tip)
+            v.addWidget(lbl)
+            v.addWidget(ed)
             btn_sel = QPushButton("参照…")
             btn_clr = QPushButton("クリア")
             btn_sel.clicked.connect(
                 lambda *_a, e=ed: self._pick_file(e, _IMAGE_FILTER))
             btn_clr.clicked.connect(lambda *_a, e=ed: self._clear_frame(e))
-            grid.addWidget(QLabel(label), r, 0)
-            grid.addWidget(ed, r, 1)
-            grid.addWidget(btn_sel, r, 2)
-            grid.addWidget(btn_clr, r, 3)
+            row = QHBoxLayout()
+            row.addWidget(btn_sel)
+            row.addWidget(btn_clr)
+            row.addStretch(1)
+            v.addLayout(row)
+        v.addStretch(1)
         self.ed_first_frame.textChanged.connect(self._update_size_label)
         return page
 
     def _build_r2v_page(self) -> QWidget:
-        page = QGroupBox("r2v 参照 (プロンプト内で <Picture i> <Video k> <Audio j> で参照)")
+        page = QGroupBox("r2v 参照")
+        page.setToolTip(
+            "プロンプト内で <Picture i> <Video k> <Audio j> のタグで参照します")
         grid = QGridLayout(page)
 
-        def make_list(label: str, lst_tip: str, max_n: int, flt: str,
-                      checkable: bool = False):
-            lst = QListWidget()
+        def make_list(title: str, lst_tip: str, max_n: int, flt: str,
+                      checkable: bool = False, placeholder: str = ""):
+            lst = PlaceholderListWidget(placeholder)
             lst.setMaximumHeight(72)
             lst.setToolTip(lst_tip)
-            btn_add = QPushButton("追加…")
-            btn_del = QPushButton("削除")
+            lbl = QLabel()
+            lbl.setToolTip(lst_tip)
+
+            def update_lbl(*_a):
+                lbl.setText(f"{title} {lst.count()}/{max_n}:")
+
+            update_lbl()
+            btn_add = QPushButton("+")
+            btn_del = QPushButton("-")
+            btn_add.setFixedWidth(28)
+            btn_del.setFixedWidth(28)
+            btn_add.setToolTip(f"{title}を追加（複数選択可・最大 {max_n} 件）")
+            btn_del.setToolTip("選択した項目を削除")
 
             def add(*_a):
-                if lst.count() >= max_n:
+                remain = max_n - lst.count()
+                if remain <= 0:
                     QMessageBox.information(self, "上限",
-                                            f"{label}は最大 {max_n} 件です。")
+                                            f"{title}は最大 {max_n} 件です。")
                     return
-                path, _ = QFileDialog.getOpenFileName(self, label, "", flt)
-                if not path:
-                    return
-                item = QListWidgetItem(Path(path).name)
-                item.setData(Qt.UserRole, path)
-                item.setToolTip(path)
-                if checkable:
-                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                    item.setCheckState(Qt.Checked)
-                lst.addItem(item)
+                paths, _ = QFileDialog.getOpenFileNames(
+                    self, f"{title}を追加", "", flt)
+                for path in paths[:remain]:
+                    item = QListWidgetItem(Path(path).name)
+                    item.setData(Qt.UserRole, path)
+                    item.setToolTip(path)
+                    if checkable:
+                        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                        item.setCheckState(Qt.Checked)
+                    lst.addItem(item)
+                if len(paths) > remain:
+                    QMessageBox.information(
+                        self, "上限",
+                        f"{title}は最大 {max_n} 件です。"
+                        f"超過した {len(paths) - remain} 件は追加されませんでした。")
+                update_lbl()
 
             def remove(*_a):
                 for it in lst.selectedItems():
                     lst.takeItem(lst.row(it))
+                update_lbl()
 
             btn_add.clicked.connect(add)
             btn_del.clicked.connect(remove)
+            # ラベルの下に +/- を横並びで置く（左列に集約して横幅を節約）。
             col = QVBoxLayout()
-            col.addWidget(btn_add)
-            col.addWidget(btn_del)
+            col.addWidget(lbl)
+            btns = QHBoxLayout()
+            btns.addWidget(btn_add)
+            btns.addWidget(btn_del)
+            btns.addStretch(1)
+            col.addLayout(btns)
             col.addStretch(1)
             return lst, col
 
         self.lst_ref_images, col1 = make_list(
-            "参照画像", "キャラクター・画風などの参照画像（最大9枚）", 9,
+            "画像", "キャラクター・画風などの参照画像（最大9枚）", 9,
             _IMAGE_FILTER)
         self.lst_ref_videos, col2 = make_list(
-            "参照動画", "参照動画 2〜15秒（最大3本）。チェックONでその動画の"
-            "音声も参照に含めます", 3, _VIDEO_FILTER, checkable=True)
+            "動画", "参照動画 2〜15秒（最大3本）。チェックONでその動画の"
+            "音声も参照に含めます", 3, _VIDEO_FILTER, checkable=True,
+            placeholder="チェックONでその動画の音声も参照に含める")
         self.lst_ref_audios, col3 = make_list(
-            "参照音声", "単体の参照音声（最大3本）", 3, _AUDIO_FILTER)
+            "音声", "単体の参照音声（最大3本）", 3, _AUDIO_FILTER)
 
-        grid.addWidget(QLabel("参照画像 (≤9):"), 0, 0)
-        grid.addWidget(self.lst_ref_images, 0, 1)
-        grid.addLayout(col1, 0, 2)
-        grid.addWidget(QLabel("参照動画 (≤3)\nチェック=音声も含める:"), 1, 0)
-        grid.addWidget(self.lst_ref_videos, 1, 1)
-        grid.addLayout(col2, 1, 2)
-        grid.addWidget(QLabel("参照音声 (≤3):"), 2, 0)
-        grid.addWidget(self.lst_ref_audios, 2, 1)
-        grid.addLayout(col3, 2, 2)
+        for r, (lst, col) in enumerate((
+                (self.lst_ref_images, col1),
+                (self.lst_ref_videos, col2),
+                (self.lst_ref_audios, col3))):
+            grid.addLayout(col, r, 0)
+            grid.addWidget(lst, r, 1)
+        grid.setColumnStretch(1, 1)
         return page
 
     def _build_settings_box(self) -> QGroupBox:
@@ -378,6 +509,9 @@ class MainWindow(QMainWindow):
         for name, aw, ah in ASPECT_PRESETS:
             self.cb_aspect.addItem(name, (aw, ah))
         self.cb_aspect.setCurrentIndex(1)  # 16:9
+        self.cb_aspect.setToolTip(
+            "出力動画のアスペクト比。\n"
+            "i2v では入力画像の縦横比が使われるため無効になります")
         self.cb_aspect.currentIndexChanged.connect(self._update_size_label)
         self.cb_quality = WideComboBox()
         for name, mp in QUALITY_PRESETS:
@@ -412,7 +546,8 @@ class MainWindow(QMainWindow):
         self.cb_dtype.addItems(["default", "fp8_e4m3fn", "fp8_e5m2"])
 
         r = 0
-        grid.addWidget(QLabel("アスペクト比"), r, 0)
+        self.lbl_aspect = QLabel("アスペクト比")
+        grid.addWidget(self.lbl_aspect, r, 0)
         grid.addWidget(self.cb_aspect, r, 1)
         grid.addWidget(QLabel("解像度"), r, 2)
         grid.addWidget(self.cb_quality, r, 3)
@@ -453,10 +588,122 @@ class MainWindow(QMainWindow):
         sh.addWidget(QLabel("audio"))
         sh.addWidget(self.sp_shift_audio)
         sh.addStretch(1)
-        grid.addWidget(self.grp_shift, r, 2, 1, 2)
+        # 全4列にまたがる独立行にして、設定ボックスの横幅を抑える。
+        r += 1
+        grid.addWidget(self.grp_shift, r, 0, 1, 4)
 
         self._update_size_label()
         return box
+
+    def _build_speed_box(self) -> QGroupBox:
+        """高速化設定: SageAttention と EasyCache をまとめたカテゴリ。"""
+        box = QGroupBox("高速化設定")
+        v = QVBoxLayout(box)
+
+        # SageAttention（バックエンド起動フラグ。切替は再起動後に反映）
+        self.chk_sage = QCheckBox("SageAttention（出力が僅かに変化）")
+        self.chk_sage.setToolTip(
+            "量子化 attention による推論高速化。\n"
+            "未導入の場合は ON にしたときにダウンロードの確認を出します。\n"
+            "切替の反映にはアプリの再起動が必要です。")
+        v.addWidget(self.chk_sage)
+        self._init_sage_checkbox()
+
+        # EasyCache（ステップスキップによる高速化）— 1行構成
+        ec = QHBoxLayout()
+        self.chk_easycache = QCheckBox("EasyCache")
+        self.chk_easycache.setToolTip(
+            "変化の小さいサンプリングステップをスキップして高速化します。\n"
+            "閾値を上げるほど速くなりますが品質が低下します（既定 0.2）。\n"
+            "スキップ数はログの \"skipped N/M steps\" で確認できます")
+        ec.addWidget(self.chk_easycache)
+        ec.addWidget(QLabel("閾値"))
+        self.sp_easycache = QDoubleSpinBox()
+        self.sp_easycache.setRange(0.0, 3.0)
+        self.sp_easycache.setSingleStep(0.05)
+        self.sp_easycache.setDecimals(2)
+        self.sp_easycache.setValue(0.2)
+        self.sp_easycache.setEnabled(False)
+        self.chk_easycache.toggled.connect(self.sp_easycache.setEnabled)
+        ec.addWidget(self.sp_easycache)
+        ec.addStretch(1)
+        v.addLayout(ec)
+        return box
+
+    def _init_sage_checkbox(self) -> None:
+        """環境の対応可否を判定して初期状態を決める（対応外なら無効化）。"""
+        gpu = environment.detect_gpu()
+        torch_tag = str(_Manifest(self.paths.manifest_path)
+                        .get("torch_tag") or "")
+        ok, reason = environment.sage_supported(gpu, torch_tag)
+        if not ok:
+            self.chk_sage.setEnabled(False)
+            self.chk_sage.setToolTip(reason)
+            return
+        # 接続はここで行い、設定復元中の発火はハンドラ側で _loading を見る。
+        self.chk_sage.toggled.connect(self._on_sage_toggled)
+
+    def _on_sage_toggled(self, checked: bool) -> None:
+        if self._loading:
+            return
+        if checked and not sage_installed(self.paths):
+            ret = QMessageBox.question(
+                self, "SageAttention",
+                "SageAttention の必要コンポーネントが未インストールです。\n"
+                "ダウンロードしてインストールしますか？",
+                QMessageBox.Yes | QMessageBox.Cancel)
+            if ret != QMessageBox.Yes:
+                self.chk_sage.blockSignals(True)
+                self.chk_sage.setChecked(False)
+                self.chk_sage.blockSignals(False)
+                return
+            self.settings["sage_attention"] = True
+            self._schedule_save()
+            self._start_sage_install()
+            return
+        self.settings["sage_attention"] = bool(checked)
+        self._schedule_save()
+        QMessageBox.information(
+            self, "SageAttention",
+            "SageAttention を{}にしました。\n"
+            "反映にはアプリの再起動が必要です。".format(
+                "有効" if checked else "無効"))
+
+    def _start_sage_install(self) -> None:
+        self.chk_sage.setEnabled(False)
+        self.append_log("SageAttention をインストールしています…")
+        thread = QThread()
+        worker = _SageInstallWorker(self.paths)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.log.connect(self.append_log)
+        worker.done.connect(self._on_sage_installed)
+        worker.failed.connect(self._on_sage_install_failed)
+        worker.done.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        _SAGE_JOBS.append((thread, worker))
+        thread.finished.connect(
+            lambda t=thread, w=worker: _SAGE_JOBS.remove((t, w)))
+        thread.start()
+
+    def _on_sage_installed(self) -> None:
+        self.chk_sage.setEnabled(True)
+        self.append_log("SageAttention のインストールが完了しました")
+        QMessageBox.information(
+            self, "SageAttention",
+            "インストールが完了しました。\n"
+            "反映にはアプリの再起動が必要です。")
+
+    def _on_sage_install_failed(self, msg: str) -> None:
+        self.chk_sage.setEnabled(True)
+        self.chk_sage.blockSignals(True)
+        self.chk_sage.setChecked(False)
+        self.chk_sage.blockSignals(False)
+        self.settings["sage_attention"] = False
+        self._schedule_save()
+        self.append_log("SageAttention のインストールに失敗: " + msg)
+        QMessageBox.warning(
+            self, "SageAttention", f"インストールに失敗しました:\n{msg}")
 
     # ----- helpers ---------------------------------------------------------
     def _mode(self) -> str:
@@ -476,8 +723,15 @@ class MainWindow(QMainWindow):
             {"t2v": 0, "i2v": 1, "r2v": 2}[mode])
         self.lbl_diffusion.setText(
             "Diffusion (ref2va):" if mode == "r2v" else "Diffusion (fl2va):")
+        # i2v は入力画像の縦横比を使うためアスペクト比設定は無効化する。
+        self.cb_aspect.setEnabled(mode != "i2v")
+        self.lbl_aspect.setEnabled(mode != "i2v")
         self._refill_diffusion()
         self._update_size_label()
+        # 適用 LoRA はチェックポイント別（fl2va / ref2va）に記憶している。
+        if hasattr(self, "_lora_flow"):
+            self._rebuild_lora_rows()
+            self._push_lora_state()
         self._schedule_save()
 
     def _update_size_label(self, *_a) -> None:
@@ -546,23 +800,319 @@ class MainWindow(QMainWindow):
                 combo.setCurrentIndex(i)
                 return
 
-    # ----- 設定ウィンドウ / SageAttention ----------------------------------
+    # ----- 設定ウィンドウ --------------------------------------------------
     def open_models_dialog(self) -> None:
         from .models_dialog import ModelsDialog
-        dlg = ModelsDialog(
-            self.paths,
-            sage_enabled=bool(self.settings.get("sage_attention", False)),
-            parent=self)
-        dlg.sage_toggled.connect(self._on_sage_setting_toggled)
+        dlg = ModelsDialog(self.paths, parent=self)
         dlg.exec()
         self.refresh_models()
 
-    def _on_sage_setting_toggled(self, enabled: bool) -> None:
-        self.settings["sage_attention"] = bool(enabled)
-        self._schedule_save()
-        self.append_log(
-            "SageAttention を{}にしました（アプリ再起動後に反映）".format(
-                "有効" if enabled else "無効"))
+    # ----- LoRA ------------------------------------------------------------
+    def _lora_family(self) -> str:
+        """適用リストのキー。t2v/i2v は fl2va を共有、r2v は ref2va。"""
+        return "ref2va" if self._mode() == "r2v" else "fl2va"
+
+    def _current_loras(self) -> list[dict]:
+        return self._loras_by_family[self._lora_family()]
+
+    def _open_lora_dialog(self) -> None:
+        from .lora_dialog import LoraDialog
+        # Non-modal, at most one instance; re-opening replaces it so the file
+        # list is always current (parentless so it can go behind us).
+        if self._lora_dlg is not None:
+            try:
+                self._lora_dlg.close()
+                self._lora_dlg.deleteLater()
+            except RuntimeError:
+                pass
+        dlg = LoraDialog(config.models_root() / "loras",
+                         self.paths.user_data / "lora_cache", None)
+        dlg.apply_requested.connect(self._on_lora_apply)
+        dlg.remove_requested.connect(self._on_lora_remove)
+        dlg.toggle_prompt_requested.connect(self._on_lora_toggle_prompt)
+        self._lora_dlg = dlg
+        self._push_lora_state()
+        self._push_lora_inserted()
+        dlg.show()
+
+    def _push_lora_state(self) -> None:
+        """Refresh the LoRA window's applied marks (if it is open)."""
+        if self._lora_dlg is None:
+            return
+        try:
+            self._lora_dlg.set_applied(
+                {e["name"]: float(e["strength"])
+                 for e in self._current_loras()})
+        except RuntimeError:
+            self._lora_dlg = None
+
+    def _on_lora_apply(self, name: str, strength: float) -> None:
+        loras = self._current_loras()
+        for e in loras:
+            if e["name"] == name:
+                e["strength"] = float(strength)
+                break
+        else:
+            loras.append({"name": name, "strength": float(strength)})
+            self.append_log(
+                f"LoRA を適用 [{self._lora_family()}]: {name} ×{strength:g}")
+        self._rebuild_lora_rows()
+        self._push_lora_state()
+
+    def _on_lora_remove(self, name: str) -> None:
+        loras = self._current_loras()
+        before = len(loras)
+        loras[:] = [e for e in loras if e["name"] != name]
+        if len(loras) != before:
+            self.append_log(f"LoRA を解除: {name}")
+        self._rebuild_lora_rows()
+        self._push_lora_state()
+
+    def _on_lora_strength_changed(self, name: str, value: float) -> None:
+        for e in self._current_loras():
+            if e["name"] == name:
+                e["strength"] = float(value)
+        self._push_lora_state()
+
+    def _rebuild_lora_rows(self) -> None:
+        """Rebuild the applied-LoRA chips after the LoRA button (flow layout;
+        index 0 is the button itself)."""
+        self._hide_lora_popup(force=True)
+        while self._lora_flow.count() > 1:
+            item = self._lora_flow.takeAt(1)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        for e in self._current_loras():
+            name = e["name"]
+            chip = QFrame()
+            chip.setObjectName("loraChip")
+            chip.setStyleSheet(
+                "#loraChip { border: 1px solid #666; border-radius: 4px; }")
+            # ホバーでトリガーワードのポップアップを出す（Enter/Leave を監視）。
+            # _lora_chip は常にポップアップの位置基準（子から入っても同じ場所）。
+            chip._lora_name = name
+            chip._lora_chip = chip
+            chip.installEventFilter(self)
+            h = QHBoxLayout(chip)
+            h.setContentsMargins(6, 1, 4, 1)
+            h.setSpacing(4)
+            trash = QPushButton("\U0001f5d1")
+            trash.setFixedWidth(24)
+            trash.setFlat(True)
+            trash.setToolTip("この LoRA を解除")
+            trash.clicked.connect(
+                lambda *_a, n=name: self._on_lora_remove(n))
+            lbl = QLabel(Path(name).stem)
+            lbl.setToolTip(name)
+            spin = QDoubleSpinBox()
+            spin.setRange(-4.0, 4.0)
+            spin.setDecimals(2)
+            spin.setSingleStep(0.05)
+            spin.setValue(float(e["strength"]))
+            spin.setFixedWidth(64)
+            spin.setToolTip("LoRA の適用強度（model / TE 共通）")
+            spin.valueChanged.connect(
+                lambda v, n=name: self._on_lora_strength_changed(n, v))
+            h.addWidget(trash)
+            h.addWidget(lbl)
+            h.addWidget(spin)
+            # 子ウィジェットに直接カーソルが入ってもポップアップが出るように
+            # 同じ監視をぶら下げる（Enter はカーソル直下のウィジェットに届く）。
+            for child in (trash, lbl, spin):
+                child._lora_name = name
+                child._lora_chip = chip
+                child.installEventFilter(self)
+            self._lora_flow.addWidget(chip)
+
+    # ----- LoRA trigger-word insertion (colored tokens) --------------------
+    def _on_lora_toggle_prompt(self, token: str, text: str) -> None:
+        """LoRA のトリガーワードをトグルする。未挿入なら挿入（区別マーク付き）、
+        挿入済みなら（ユーザー編集後でも）その区間ごと削除する。"""
+        field = self.txt_prompt
+        regions = self._find_token_regions(field, token)
+        if regions:
+            self._remove_token_regions(field, regions)
+        else:
+            self._insert_token_words(field, token, text)
+        self._push_lora_inserted()
+
+    @staticmethod
+    def _plain_char_format() -> QTextCharFormat:
+        """token を持たない通常書式（区切りや以降の入力がハイライトされない
+        ようにするため）。"""
+        fmt = QTextCharFormat()
+        fmt.clearBackground()
+        return fmt
+
+    def _token_char_format(self, token: str) -> QTextCharFormat:
+        fmt = QTextCharFormat()
+        fmt.setBackground(_LORA_INSERT_BG)
+        fmt.setForeground(_LORA_INSERT_FG)
+        fmt.setProperty(_LORA_TOKEN_PROP, token)
+        return fmt
+
+    @staticmethod
+    def _find_token_regions(field, token: str) -> list[tuple[int, int]]:
+        """指定 token の文字書式を持つ連続区間 (start, end) を左から順に返す。
+        内部編集でフラグメントが分割されていても隣接分は1区間に統合する。"""
+        doc = field.document()
+        frags: list[tuple[int, int]] = []
+        block = doc.begin()
+        while block != doc.end():
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid() and \
+                        frag.charFormat().property(_LORA_TOKEN_PROP) == token:
+                    start = frag.position()
+                    frags.append((start, start + frag.length()))
+                it += 1
+            block = block.next()
+        frags.sort()
+        regions: list[tuple[int, int]] = []
+        for s, e in frags:
+            if regions and s <= regions[-1][1]:
+                regions[-1] = (regions[-1][0], max(regions[-1][1], e))
+            else:
+                regions.append((s, e))
+        return regions
+
+    def _remove_token_regions(self, field,
+                              regions: list[tuple[int, int]]) -> None:
+        """token 区間を削除する。挿入時に付けた直後の色なしスペースと、
+        隣接する区切り ", " も1つ巻き込んで取り除き、", ," や余分な空白が
+        残らないようにする。位置ズレを避けるため右端の区間から削除する。"""
+        text = field.toPlainText()
+        cursor = field.textCursor()
+        for start, end in sorted(regions, reverse=True):
+            s, e = start, end
+            lead = text[s - 2:s] == ", "
+            # 挿入時の色なし後続スペースを巻き込む。ただし前側の区切りも
+            # 取る場合、スペースの先にユーザーの追記があるなら残す
+            # （両方消すと前後のテキストが癒着するため）。
+            if text[e:e + 1] == " " and (not lead or not text[e + 1:].strip()):
+                e += 1
+            if lead:                        # 直前の区切りを巻き込む
+                s -= 2
+            elif text[e:e + 2] == ", ":     # 先頭要素なら直後の区切りを
+                e += 2
+            cursor.setPosition(s)
+            cursor.setPosition(e, QTextCursor.KeepAnchor)
+            cursor.removeSelectedText()
+        field.setCurrentCharFormat(self._plain_char_format())
+
+    def _insert_token_words(self, field, token: str, text: str) -> None:
+        """欄末尾に、区別マーク付きでワードを追記する。
+
+        色付き区間の直後に入力すると Qt は左隣の書式（=色）を引き継ぐため、
+        区間の直後に色なしスペースを1つ置く。前側は色なしの ", " 区切りが
+        同じ役割を果たす。これで続けて追記しても色は付かない。
+        """
+        words = [w.strip() for w in text.split(",") if w.strip()]
+        if not words:
+            return
+        joined = ", ".join(words)
+        full = field.toPlainText()
+        stripped = full.rstrip()
+        cursor = field.textCursor()
+        cursor.setPosition(len(stripped))
+        cursor.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+        cursor.removeSelectedText()
+        if stripped:
+            cursor.insertText(", ", self._plain_char_format())
+        cursor.insertText(joined, self._token_char_format(token))
+        cursor.insertText(" ", self._plain_char_format())
+        field.setTextCursor(cursor)
+        field.setCurrentCharFormat(self._plain_char_format())
+
+    def _active_lora_tokens(self) -> set[str]:
+        """プロンプト欄に現在挿入されている LoRA トリガーワードの token 集合。"""
+        tokens: set[str] = set()
+        doc = self.txt_prompt.document()
+        block = doc.begin()
+        while block != doc.end():
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid():
+                    tok = frag.charFormat().property(_LORA_TOKEN_PROP)
+                    if tok:
+                        tokens.add(str(tok))
+                it += 1
+            block = block.next()
+        return tokens
+
+    def _push_lora_inserted(self) -> None:
+        """挿入済み token を LoRA ウィンドウ・チップのポップアップへ通知
+        （リンクの挿入済みハイライト更新用）。"""
+        tokens = self._active_lora_tokens()
+        if self._lora_dlg is not None:
+            try:
+                self._lora_dlg.set_inserted(tokens)
+            except RuntimeError:
+                self._lora_dlg = None
+        if self._lora_popup is not None and self._lora_popup.isVisible():
+            self._lora_popup.set_active(tokens)
+
+    # ----- LoRA chip hover popup -------------------------------------------
+    def _ensure_lora_popup(self):
+        if self._lora_popup is None:
+            from .lora_dialog import TriggerWordsPopup
+            self._lora_popup = TriggerWordsPopup(self)
+            self._lora_popup.toggle_requested.connect(
+                self._on_lora_toggle_prompt)
+            self._lora_popup.hover_changed.connect(self._on_lora_popup_hover)
+        return self._lora_popup
+
+    def _show_lora_popup(self, relname: str, anchor) -> None:
+        pos, _neg = lora_meta.effective_trigger_words(
+            relname, config.models_root() / "loras",
+            self.paths.user_data / "lora_cache")
+        popup = self._ensure_lora_popup()
+        popup.set_content(relname, pos, self._active_lora_tokens())
+        if not popup.has_words():        # トリガーワードが無ければ出さない
+            popup.hide()
+            return
+        self._lora_pop_timer.stop()
+        self._lora_pop_anchor = anchor
+        # サイズは set_content で確定済み。画面内に収まる位置へクランプする。
+        below = anchor.mapToGlobal(QPoint(0, anchor.height() + 2))
+        screen = (anchor.screen() or self.screen()).availableGeometry()
+        y = below.y()
+        if y + popup.height() - 1 > screen.bottom():
+            y = anchor.mapToGlobal(QPoint(0, 0)).y() - popup.height() - 2
+        x = max(screen.left(),
+                min(below.x(), screen.right() - popup.width() + 1))
+        y = max(screen.top(), min(y, screen.bottom() - popup.height() + 1))
+        popup.move(x, y)
+        popup.show()
+        popup.raise_()
+
+    def _on_lora_popup_hover(self, over: bool) -> None:
+        if over:
+            self._lora_pop_timer.stop()
+        else:
+            self._lora_pop_timer.start()
+
+    def _hide_lora_popup(self, force: bool = False) -> None:
+        """カーソルがまだチップ or ポップアップ上にあれば閉じない（チップの
+        子ウィジェット上でも Leave が飛ぶため、実際の位置で判定する）。
+        force=True は無条件で閉じる（チップ再構築時など）。"""
+        if self._lora_popup is None or not self._lora_popup.isVisible():
+            return
+        if not force:
+            gp = QCursor.pos()
+            for w in (self._lora_popup, self._lora_pop_anchor):
+                try:
+                    if (w is not None and w.isVisible()
+                            and w.rect().contains(w.mapFromGlobal(gp))):
+                        self._lora_pop_timer.start()   # まだ上にある → 保持
+                        return
+                except RuntimeError:
+                    pass                               # チップが破棄済み
+        self._lora_popup.hide()
+        self._lora_pop_anchor = None
 
     # ----- prompt presets --------------------------------------------------
     def _reload_prompt_presets(self, *_args, quiet: bool = False) -> None:
@@ -632,7 +1182,27 @@ class MainWindow(QMainWindow):
         self.grp_shift.setChecked(bool(s.get("shift_enabled", False)))
         self.sp_shift_video.setValue(float(s.get("shift_video", 12.0)))
         self.sp_shift_audio.setValue(float(s.get("shift_audio", 3.0)))
+        self.chk_easycache.setChecked(bool(s.get("easycache_enabled", False)))
+        self.sp_easycache.setValue(float(s.get("easycache_threshold", 0.2)))
+        if self.chk_sage.isEnabled():
+            self.chk_sage.setChecked(bool(s.get("sage_attention", False)))
         self._ref_image_size = str(s.get("ref_image_size", "match"))
+        # ウィンドウ/ペインサイズの復元（保存が無ければ既定のまま）。
+        ws = str(s.get("window_size", ""))
+        if "x" in ws:
+            try:
+                ww, hh = (int(v) for v in ws.split("x", 1))
+                self.resize(max(400, ww), max(300, hh))
+            except ValueError:
+                pass
+        ps = str(s.get("pane_sizes", ""))
+        if ps:
+            try:
+                sizes = [int(v) for v in ps.split(",")]
+                if len(sizes) == 3 and all(v > 0 for v in sizes):
+                    self.splitter.setSizes(sizes)
+            except ValueError:
+                pass
         self._update_size_label()
 
     def _connect_autosave(self) -> None:
@@ -646,7 +1216,10 @@ class MainWindow(QMainWindow):
         self.sp_shift_video.valueChanged.connect(self._schedule_save)
         self.sp_shift_audio.valueChanged.connect(self._schedule_save)
         self.grp_shift.toggled.connect(self._schedule_save)
+        self.chk_easycache.toggled.connect(self._schedule_save)
+        self.sp_easycache.valueChanged.connect(self._schedule_save)
         self.ed_seed.textChanged.connect(self._schedule_save)
+        self.splitter.splitterMoved.connect(self._schedule_save)
 
     def _schedule_save(self, *args) -> None:
         if self._loading:
@@ -683,8 +1256,17 @@ class MainWindow(QMainWindow):
             "shift_enabled": self.grp_shift.isChecked(),
             "shift_video": float(self.sp_shift_video.value()),
             "shift_audio": float(self.sp_shift_audio.value()),
+            "easycache_enabled": self.chk_easycache.isChecked(),
+            "easycache_threshold": float(self.sp_easycache.value()),
             "ref_image_size": getattr(self, "_ref_image_size", "match"),
         }
+        # ジオメトリはウィンドウ表示後のみ保存する。未表示（起動処理中）の
+        # splitter.sizes() はレイアウト未確定の仮値で、保存すると復元済みの
+        # 正しい値を上書きで壊してしまう。
+        if self.isVisible():
+            data["window_size"] = f"{self.width()}x{self.height()}"
+            data["pane_sizes"] = ",".join(
+                str(v) for v in self.splitter.sizes())
         self.settings.update(data)
         try:
             settings.save(self.paths.settings_path, self.settings)
@@ -796,6 +1378,10 @@ class MainWindow(QMainWindow):
             shift_enabled=self.grp_shift.isChecked(),
             shift_video=float(self.sp_shift_video.value()),
             shift_audio=float(self.sp_shift_audio.value()),
+            loras=[(e["name"], float(e["strength"]))
+                   for e in self._current_loras()],
+            easycache_enabled=self.chk_easycache.isChecked(),
+            easycache_threshold=float(self.sp_easycache.value()),
             first_frame=first,
             last_frame=last,
             ref_image_size=getattr(self, "_ref_image_size", "match"),
@@ -917,7 +1503,7 @@ class MainWindow(QMainWindow):
             for v in videos:
                 self.append_log(f"{v} に保存しました")
             self.preview.setToolTip(
-                f"{videos[0]}\nダブルクリックで再生")
+                f"{videos[0]}\nダブルクリック=外部プレーヤーで再生")
         else:
             self.status.showMessage("完了（出力ファイルが見つかりません）")
             self.append_log("警告: 出力動画が見つかりませんでした")
@@ -967,14 +1553,27 @@ class MainWindow(QMainWindow):
                 and event.modifiers() & Qt.ShiftModifier):
             self.on_generate()
             return True
-        # プレビューのダブルクリックで最後の動画を再生。
+        # プレビュー欄: ダブルクリックで直近の動画を外部プレーヤーで再生。
         if (obj is getattr(self, "preview", None)
                 and event.type() == QEvent.MouseButtonDblClick):
             if self._last_video and self._last_video.exists():
                 QDesktopServices.openUrl(
                     QUrl.fromLocalFile(str(self._last_video)))
             return True
+        # LoRA チップのホバーでトリガーワードのポップアップを開閉する。
+        name = getattr(obj, "_lora_name", None)
+        if name is not None:
+            if event.type() == QEvent.Enter:
+                self._show_lora_popup(name, getattr(obj, "_lora_chip", obj))
+            elif event.type() == QEvent.Leave:
+                self._lora_pop_timer.start()   # 猶予後に閉じる（保持判定つき）
         return super().eventFilter(obj, event)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt signature)
+        super().resizeEvent(event)
+        # ウィンドウサイズも自動保存（構築中・設定復元中は _loading が守る）。
+        if not getattr(self, "_loading", True):
+            self._schedule_save()
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt signature)
         if self._gen_worker:

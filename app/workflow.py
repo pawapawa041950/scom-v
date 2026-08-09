@@ -96,6 +96,14 @@ class GenParams:
     shift_enabled: bool = False
     shift_video: float = 12.0
     shift_audio: float = 3.0
+    # Applied LoRAs: [(models/loras 内のファイル名, 強度), ...] を順に連結。
+    # 強度は model / clip 共通。
+    loras: list[tuple[str, float]] = field(default_factory=list)
+    # EasyCache: 変化の小さいサンプリングステップをスキップする公式高速化。
+    # threshold を上げるほど速いが品質が落ちる（既定 0.2）。v0.31 で H3 の
+    # 音声破損が修正され安全に併用できる。
+    easycache_enabled: bool = False
+    easycache_threshold: float = 0.2
     # i2v: 開始/終端フレーム（アップロード済み画像名。空 = 未指定）
     first_frame: str = ""
     last_frame: str = ""
@@ -135,7 +143,22 @@ def build_graph(p: GenParams) -> dict:
     g["3"] = {"class_type": "VAELoader", "inputs": {"vae_name": p.vae_video}}
     g["4"] = {"class_type": "VAELoader", "inputs": {"vae_name": p.vae_audio}}
 
+    # LoRA chain: model と clip を LoraLoader に順に通す（node id 60〜。
+    # 20〜は画像/参照ローダが使うため衝突しない）。
     model_src: list = ["1", 0]
+    clip_src: list = ["2", 0]
+    for i, (lora_name, strength) in enumerate(p.loras):
+        if not lora_name:
+            raise ValueError("LoRA のファイル名が空です")
+        nid = str(60 + i)
+        g[nid] = {"class_type": "LoraLoader",
+                  "inputs": {"lora_name": lora_name,
+                             "strength_model": float(strength),
+                             "strength_clip": float(strength),
+                             "model": model_src, "clip": clip_src}}
+        model_src = [nid, 0]
+        clip_src = [nid, 1]
+
     if p.shift_enabled:
         g["6"] = {"class_type": "MiniMaxH3SigmaShift",
                   "inputs": {"model": model_src,
@@ -143,10 +166,18 @@ def build_graph(p: GenParams) -> dict:
                              "shift_audio": float(p.shift_audio)}}
         model_src = ["6", 0]
 
+    if p.easycache_enabled:
+        g["17"] = {"class_type": "EasyCache",
+                   "inputs": {"model": model_src,
+                              "reuse_threshold": float(p.easycache_threshold),
+                              "start_percent": 0.15, "end_percent": 0.95,
+                              "verbose": False}}
+        model_src = ["17", 0]
+
     # ----- conditioning + AV latent ---------------------------------------
     if p.mode in ("t2v", "i2v"):
         inputs = {
-            "clip": ["2", 0],
+            "clip": clip_src,
             "vae": ["3", 0],
             "prompt": p.prompt,
             "width": int(p.width),
@@ -173,7 +204,7 @@ def build_graph(p: GenParams) -> dict:
         if len(p.ref_audios) > 3:
             raise ValueError("参照音声は最大3本です")
         inputs = {
-            "clip": ["2", 0],
+            "clip": clip_src,
             "vae": ["3", 0],
             "audio_vae": ["4", 0],
             "prompt": p.prompt,
@@ -182,26 +213,29 @@ def build_graph(p: GenParams) -> dict:
             "length": int(p.frames),
             "ref_image_size": p.ref_image_size,
         }
+        # Autogrow 入力の API 形式は「<親ID>.<プレフィックス><0始まり連番>」
+        # （例: ref_images.ref_image_0）。プロンプト内の <Picture i> タグは
+        # 1始まりだが、入力キーは 0 始まりである点に注意。
         nid = 20
-        for i, name in enumerate(p.ref_images, start=1):
+        for i, name in enumerate(p.ref_images):
             g[str(nid)] = {"class_type": "LoadImage",
                            "inputs": {"image": name}}
-            inputs[f"ref_image_{i}"] = [str(nid), 0]
+            inputs[f"ref_images.ref_image_{i}"] = [str(nid), 0]
             nid += 1
-        for i, rv in enumerate(p.ref_videos, start=1):
+        for i, rv in enumerate(p.ref_videos):
             load_id = str(nid); nid += 1
             comp_id = str(nid); nid += 1
             g[load_id] = {"class_type": "LoadVideo",
                           "inputs": {"file": rv["name"]}}
             g[comp_id] = {"class_type": "GetVideoComponents",
                           "inputs": {"video": [load_id, 0]}}
-            inputs[f"ref_video_{i}"] = [comp_id, 0]
+            inputs[f"ref_videos.ref_video_{i}"] = [comp_id, 0]
             if rv.get("use_audio"):
-                inputs[f"ref_video_audio_{i}"] = [comp_id, 1]
-        for i, name in enumerate(p.ref_audios, start=1):
+                inputs[f"ref_video_audios.ref_video_audio_{i}"] = [comp_id, 1]
+        for i, name in enumerate(p.ref_audios):
             g[str(nid)] = {"class_type": "LoadAudio",
                            "inputs": {"audio": name}}
-            inputs[f"ref_audio_{i}"] = [str(nid), 0]
+            inputs[f"ref_audios.ref_audio_{i}"] = [str(nid), 0]
             nid += 1
         g["5"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": inputs}
 
@@ -227,8 +261,10 @@ def build_graph(p: GenParams) -> dict:
     g["14"] = {"class_type": "CreateVideo",
                "inputs": {"images": ["12", 0], "fps": float(FPS),
                           "audio": ["13", 0], "bit_depth": 8}}
+    # codec は DynamicCombo: API 形式ではオプションキーの文字列を渡す
+    # （実行側が {"codec": "auto"} に組み立てて execute に渡す）。
     g["15"] = {"class_type": "SaveVideo",
                "inputs": {"video": ["14", 0],
                           "filename_prefix": p.filename_prefix,
-                          "format": "auto", "codec": {"codec": "auto"}}}
+                          "format": "auto", "codec": "auto"}}
     return g

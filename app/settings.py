@@ -37,11 +37,17 @@ DEFAULTS: dict[str, Any] = {
     "shift_enabled": False,
     "shift_video": 12.0,
     "shift_audio": 3.0,
+    # EasyCache 高速化（ステップスキップ。閾値が大きいほど速いが品質低下）
+    "easycache_enabled": False,
+    "easycache_threshold": 0.2,
     # r2v
     "ref_image_size": "match",
     # SageAttention（量子化attentionによる高速化）。ONでもパッケージ未導入なら
     # 起動フラグは付けない（バックエンドが起動不能になるため）。
     "sage_attention": False,
+    # ウィンドウ/ペインのサイズ（自動保存・復元）
+    "window_size": "1209x675",
+    "pane_sizes": "382,457,360",   # 左,中央,右
 }
 
 

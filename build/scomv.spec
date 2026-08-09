@@ -14,14 +14,14 @@ import os
 # repo root. Using it keeps the build working regardless of the current dir.
 ROOT = os.path.dirname(SPECPATH)
 
-# Qt modules this QtWidgets-only app never touches. Excluding the big ones keeps
-# the single exe smaller / faster to unpack. (Unknown names are simply ignored.)
+# Qt modules this app never touches. Excluding the big ones keeps the single
+# exe smaller / faster to unpack. (Unknown names are simply ignored.)
 _EXCLUDES = [
+    "PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets",
     "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets",
     "PySide6.QtWebEngineQuick", "PySide6.QtQuick", "PySide6.QtQuick3D",
     "PySide6.QtQml", "PySide6.Qt3DCore", "PySide6.Qt3DRender",
-    "PySide6.Qt3DAnimation", "PySide6.Qt3DExtras", "PySide6.QtMultimedia",
-    "PySide6.QtMultimediaWidgets", "PySide6.QtCharts",
+    "PySide6.Qt3DAnimation", "PySide6.Qt3DExtras", "PySide6.QtCharts",
     "PySide6.QtDataVisualization", "PySide6.QtPdf", "PySide6.QtPdfWidgets",
     "PySide6.QtDesigner", "PySide6.QtQuickWidgets", "PySide6.QtQuick3DRuntimeRender",
     "PySide6.QtSensors", "PySide6.QtBluetooth", "PySide6.QtPositioning",

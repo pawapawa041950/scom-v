@@ -2,10 +2,31 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt
+from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QHBoxLayout, QLabel, QLayout, QProgressBar,
-    QProxyStyle, QSizePolicy, QStyle, QTextEdit, QWidget,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QLayout, QListWidget,
+    QProgressBar, QProxyStyle, QSizePolicy, QStyle, QTextEdit, QWidget,
 )
+
+
+class PlaceholderListWidget(QListWidget):
+    """QListWidget with a faint placeholder text drawn while the list is
+    empty (QLineEdit の placeholderText 相当。QListWidget には標準機能が
+    ないため自前で描画する)。"""
+
+    def __init__(self, placeholder: str = "", parent=None):
+        super().__init__(parent)
+        self._placeholder = placeholder
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt signature)
+        super().paintEvent(event)
+        if self.count() or not self._placeholder:
+            return
+        p = QPainter(self.viewport())
+        p.setPen(self.palette().placeholderText().color())
+        p.drawText(self.viewport().rect().adjusted(6, 4, -6, -4),
+                   Qt.AlignTop | Qt.AlignLeft | Qt.TextWordWrap,
+                   self._placeholder)
 
 
 class FlowLayout(QLayout):
@@ -130,15 +151,19 @@ class CompactSpinStyle(QProxyStyle):
 class GrowingTextEdit(QTextEdit):
     """A plain-text edit that grows its height to fit its content.
 
-    The vertical scrollbar is disabled — the widget resizes instead, so the
-    full prompt is always visible without scrolling.
+    ``max_lines`` 行までは内容に合わせて伸び、それ以上は高さを固定して
+    縦スクロールバーを出す（ウィンドウが画面からはみ出すのを防ぐ）。
+    ``max_lines=None`` なら従来どおり無制限に伸びる。
     """
 
-    def __init__(self, parent=None, min_lines: int = 3):
+    def __init__(self, parent=None, min_lines: int = 3,
+                 max_lines: int | None = None):
         super().__init__(parent)
         self._min_lines = min_lines
+        self._max_lines = max_lines
         self.setAcceptRichText(False)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(
+            Qt.ScrollBarAsNeeded if max_lines else Qt.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setLineWrapMode(QTextEdit.WidgetWidth)
         # The document lays itself out at the viewport width automatically; this
@@ -151,8 +176,12 @@ class GrowingTextEdit(QTextEdit):
         doc_h = self.document().documentLayout().documentSize().height()
         min_h = self.fontMetrics().lineSpacing() * self._min_lines
         m = self.contentsMargins()
-        height = int(max(doc_h, min_h)) + m.top() + m.bottom() \
-            + 2 * self.frameWidth() + 4
+        extra = m.top() + m.bottom() + 2 * self.frameWidth() + 4
+        height = int(max(doc_h, min_h)) + extra
+        if self._max_lines is not None:
+            max_h = int(self.fontMetrics().lineSpacing()
+                        * self._max_lines) + extra
+            height = min(height, max_h)
         if height != self.height():
             self.setFixedHeight(height)
 
