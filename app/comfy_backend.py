@@ -209,8 +209,14 @@ class ComfyBackend:
         self._proc = None
 
     # ----- generation ------------------------------------------------------
-    def _post_prompt(self, graph: dict) -> str:
-        payload = json.dumps({"prompt": graph, "client_id": self.client_id}).encode()
+    def _post_prompt(self, graph: dict,
+                     extra_pnginfo: Optional[dict] = None) -> str:
+        body: dict = {"prompt": graph, "client_id": self.client_id}
+        if extra_pnginfo:
+            # SaveVideo の hidden.extra_pnginfo に渡り、mp4 のコンテナタグ
+            # として埋め込まれる（文字列はそのまま、辞書は JSON 化）。
+            body["extra_data"] = {"extra_pnginfo": extra_pnginfo}
+        payload = json.dumps(body).encode()
         req = urllib.request.Request(
             self.base_url + "/prompt", data=payload,
             headers={"Content-Type": "application/json"},
@@ -289,7 +295,8 @@ class ComfyBackend:
                  on_preview: Optional[Callable[[bytes], None]] = None,
                  cancel: Optional[Callable[[], bool]] = None,
                  on_cached: Optional[Callable[[list], None]] = None,
-                 on_timing: Optional[Callable[[float], None]] = None) -> list[Path]:
+                 on_timing: Optional[Callable[[float], None]] = None,
+                 extra_pnginfo: Optional[dict] = None) -> list[Path]:
         """Run a graph to completion and return the saved output file paths
         (SaveVideo が userdata/output に書いた動画等の絶対パス)。
 
@@ -323,7 +330,7 @@ class ComfyBackend:
         )
         ws.settimeout(1.0)
 
-        prompt_id = self._post_prompt(graph)
+        prompt_id = self._post_prompt(graph, extra_pnginfo)
         try:
             while True:
                 if cancel():

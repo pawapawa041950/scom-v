@@ -26,6 +26,10 @@ DEFAULTS: dict[str, Any] = {
     # generation settings
     "aspect": "16:9",
     "quality_mp": 1.0,       # 目標メガピクセル（1.0 ≒ 768p級）
+    # 出力解像度の手動指定（OFF = アスペクト比/解像度から自動計算）
+    "size_manual": False,
+    "size_w": 1344,
+    "size_h": 768,
     "length_sec": 5.0,       # 動画の長さ（秒。17n+5 フレームへスナップ）
     "steps": 20,
     "sampler": "res_multistep",

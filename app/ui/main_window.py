@@ -108,10 +108,12 @@ class _GenWorker(QObject):
     done = Signal(list)      # list[Path] 保存された出力ファイル
     failed = Signal(str)
 
-    def __init__(self, backend: ComfyBackend, graph: dict):
+    def __init__(self, backend: ComfyBackend, graph: dict,
+                 extra_pnginfo: Optional[dict] = None):
         super().__init__()
         self.backend = backend
         self.graph = graph
+        self.extra_pnginfo = extra_pnginfo
         self._cancel = False
 
     def cancel(self) -> None:
@@ -125,6 +127,7 @@ class _GenWorker(QObject):
                 on_preview=self.preview.emit,
                 cancel=lambda: self._cancel,
                 on_timing=self.timing.emit,
+                extra_pnginfo=self.extra_pnginfo,
             )
             self.done.emit(list(files))
         except BackendError as e:
@@ -516,7 +519,9 @@ class MainWindow(QMainWindow):
         self.cb_quality = WideComboBox()
         for name, mp in QUALITY_PRESETS:
             self.cb_quality.addItem(name, mp)
-        self.cb_quality.currentIndexChanged.connect(self._update_size_label)
+        # data=None が「手動指定」（出力スピンボックスで直接指定）の印。
+        self.cb_quality.addItem("手動指定", None)
+        self.cb_quality.currentIndexChanged.connect(self._on_quality_changed)
 
         self.lbl_size = QLabel("")
         self.sp_length = QDoubleSpinBox()
@@ -552,9 +557,31 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel("解像度"), r, 2)
         grid.addWidget(self.cb_quality, r, 3)
         r += 1
+        grid.addWidget(QLabel("出力"), r, 0)
+        size_row = QWidget()
+        size_row.setToolTip(
+            "出力解像度。解像度で「手動指定」を選ぶと編集できます"
+            "（32の倍数へ丸められます）。\n"
+            "それ以外ではアスペクト比と解像度から自動計算した値が入ります")
+        sr = QHBoxLayout(size_row)
+        sr.setContentsMargins(0, 0, 0, 0)
+        self.sp_out_w = QSpinBox()
+        self.sp_out_h = QSpinBox()
+        for sp in (self.sp_out_w, self.sp_out_h):
+            sp.setRange(32, 4096)
+            sp.setSingleStep(32)
+            sp.setEnabled(False)   # 「手動指定」以外はグレーアウト（自動値を表示）
+        self.sp_out_w.setValue(1344)
+        self.sp_out_h.setValue(768)
+        sr.addWidget(self.sp_out_w)
+        sr.addWidget(QLabel("×"))
+        sr.addWidget(self.sp_out_h)
+        sr.addStretch(1)
+        grid.addWidget(size_row, r, 1, 1, 3)
+        r += 1
         grid.addWidget(QLabel("長さ"), r, 0)
         grid.addWidget(self.sp_length, r, 1)
-        grid.addWidget(QLabel("出力"), r, 2)
+        grid.addWidget(QLabel("フレーム"), r, 2)
         grid.addWidget(self.lbl_size, r, 3)
         r += 1
         grid.addWidget(QLabel("Steps"), r, 0)
@@ -723,9 +750,8 @@ class MainWindow(QMainWindow):
             {"t2v": 0, "i2v": 1, "r2v": 2}[mode])
         self.lbl_diffusion.setText(
             "Diffusion (ref2va):" if mode == "r2v" else "Diffusion (fl2va):")
-        # i2v は入力画像の縦横比を使うためアスペクト比設定は無効化する。
-        self.cb_aspect.setEnabled(mode != "i2v")
-        self.lbl_aspect.setEnabled(mode != "i2v")
+        # アスペクト比の有効/無効（i2v・手動指定で無効）とサイズ再計算。
+        self._on_quality_changed()
         self._refill_diffusion()
         self._update_size_label()
         # 適用 LoRA はチェックポイント別（fl2va / ref2va）に記憶している。
@@ -734,22 +760,42 @@ class MainWindow(QMainWindow):
             self._push_lora_state()
         self._schedule_save()
 
-    def _update_size_label(self, *_a) -> None:
-        mode = self._mode()
+    def _auto_size(self) -> tuple[int, int]:
+        """アスペクト比/解像度（i2v は入力画像）から出力サイズを計算する。"""
         mp = float(self.cb_quality.currentData() or 1.0)
-        frames = frames_for_seconds(self.sp_length.value())
-        secs = frames / workflow.FPS
-        if mode == "i2v" and self.ed_first_frame.text():
+        if self._mode() == "i2v" and self.ed_first_frame.text():
             img = QImage(self.ed_first_frame.text())
             if not img.isNull():
-                w, h = size_for_image(img.width(), img.height(), mp)
-                self.lbl_size.setText(
-                    f"{w}x{h}（画像基準）  {frames}f ≈ {secs:.1f}s")
-                return
+                return size_for_image(img.width(), img.height(), mp)
         aw, ah = self.cb_aspect.currentData() or (16, 9)
-        w, h = size_for_aspect(aw, ah, mp)
-        note = "（i2v は画像基準）" if mode == "i2v" else ""
-        self.lbl_size.setText(f"{w}x{h}{note}  {frames}f ≈ {secs:.1f}s")
+        return size_for_aspect(aw, ah, mp)
+
+    def _size_is_manual(self) -> bool:
+        """解像度コンボが「手動指定」（data=None）か。"""
+        return self.cb_quality.currentData() is None
+
+    def _update_size_label(self, *_a) -> None:
+        frames = frames_for_seconds(self.sp_length.value())
+        secs = frames / workflow.FPS
+        self.lbl_size.setText(f"{frames}f ≈ {secs:.1f}s")
+        # 手動指定でないときは算出値をスピンボックスへ反映する
+        # （保存は発火させない）。
+        if not self._size_is_manual():
+            w, h = self._auto_size()
+            for sp, v in ((self.sp_out_w, w), (self.sp_out_h, h)):
+                sp.blockSignals(True)
+                sp.setValue(int(v))
+                sp.blockSignals(False)
+
+    def _on_quality_changed(self, *_a) -> None:
+        manual = self._size_is_manual()
+        self.sp_out_w.setEnabled(manual)
+        self.sp_out_h.setEnabled(manual)
+        # アスペクト比は「i2v（画像基準）」か「手動指定」では使われない。
+        en = (self._mode() != "i2v") and not manual
+        self.cb_aspect.setEnabled(en)
+        self.lbl_aspect.setEnabled(en)
+        self._update_size_label()
 
     # ----- model scan ------------------------------------------------------
     def refresh_models(self) -> None:
@@ -1170,9 +1216,15 @@ class MainWindow(QMainWindow):
             self.cb_aspect.setCurrentIndex(ai)
         qmp = float(s.get("quality_mp", 1.0))
         for i in range(self.cb_quality.count()):
-            if abs(float(self.cb_quality.itemData(i)) - qmp) < 1e-6:
+            d = self.cb_quality.itemData(i)   # None = 手動指定の項目
+            if d is not None and abs(float(d) - qmp) < 1e-6:
                 self.cb_quality.setCurrentIndex(i)
                 break
+        self.sp_out_w.setValue(int(s.get("size_w", 1344)))
+        self.sp_out_h.setValue(int(s.get("size_h", 768)))
+        if bool(s.get("size_manual", False)):
+            self.cb_quality.setCurrentIndex(self.cb_quality.count() - 1)
+        self._on_quality_changed()
         self.sp_length.setValue(float(s.get("length_sec", 5.0)))
         self.sp_steps.setValue(int(s.get("steps", 20)))
         self.cb_sampler.setCurrentText(str(s.get("sampler", "res_multistep")))
@@ -1212,6 +1264,8 @@ class MainWindow(QMainWindow):
                       self.cb_dtype):
             combo.currentTextChanged.connect(self._schedule_save)
         self.sp_length.valueChanged.connect(self._schedule_save)
+        self.sp_out_w.valueChanged.connect(self._schedule_save)
+        self.sp_out_h.valueChanged.connect(self._schedule_save)
         self.sp_steps.valueChanged.connect(self._schedule_save)
         self.sp_shift_video.valueChanged.connect(self._schedule_save)
         self.sp_shift_audio.valueChanged.connect(self._schedule_save)
@@ -1247,6 +1301,9 @@ class MainWindow(QMainWindow):
             "vae_audio": self.cb_vae_audio.currentText(),
             "aspect": self.cb_aspect.currentText(),
             "quality_mp": float(self.cb_quality.currentData() or 1.0),
+            "size_manual": self._size_is_manual(),
+            "size_w": int(self.sp_out_w.value()),
+            "size_h": int(self.sp_out_h.value()),
             "length_sec": float(self.sp_length.value()),
             "steps": self.sp_steps.value(),
             "sampler": self.cb_sampler.currentText(),
@@ -1331,10 +1388,15 @@ class MainWindow(QMainWindow):
                 first = self._upload(self.ed_first_frame.text())
             if self.ed_last_frame.text():
                 last = self._upload(self.ed_last_frame.text())
-        # 解像度: i2v は開始（無ければ終端）フレーム画像基準、他はプリセット。
+        # 解像度: 手動指定が最優先。自動は i2v なら開始（無ければ終端）
+        # フレーム画像基準、他はプリセットから計算。
         base_img = (self.ed_first_frame.text() or self.ed_last_frame.text()) \
             if mode == "i2v" else ""
-        if base_img:
+        if self._size_is_manual():
+            # H3 のノード入力は32刻みのため丸める（UI のステップも32）。
+            width = max(32, round(self.sp_out_w.value() / 32) * 32)
+            height = max(32, round(self.sp_out_h.value() / 32) * 32)
+        elif base_img:
             img = QImage(base_img)
             if img.isNull():
                 raise ValueError(f"画像を読み込めません: {base_img}")
@@ -1431,7 +1493,11 @@ class MainWindow(QMainWindow):
             f"{params.width}x{params.height} {params.frames}f ({secs:.1f}s)")
 
         self._gen_thread = QThread(self)
-        self._gen_worker = _GenWorker(self.backend, graph)
+        # mp4 のメタデータは ComfyUI 標準（workflow JSON）に任せ、生成アプリ
+        # の識別用に software タグだけを追加する。
+        self._gen_worker = _GenWorker(
+            self.backend, graph,
+            extra_pnginfo={"software": config.APP_SIGNATURE})
         self._gen_worker.moveToThread(self._gen_thread)
         self._gen_thread.started.connect(self._gen_worker.run)
         self._gen_worker.progress.connect(self._on_progress)
