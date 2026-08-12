@@ -57,6 +57,15 @@ DEFAULT_MODELS: list[ModelFile] = [
         5_207_808_496, required=True),
     _h3("vae", "minimax_h3_audio_vae_fp32.safetensors",
         605_254_808, required=True),
+    # --- プレビュー用 tiny デコーダ（コミュニティ製、9.8MB）------------------
+    # サンプリング中プレビューを Latent2RGB より大幅に高品質化する。
+    # 選択UIには出さず、セットアップ時と通常起動時に自動取得する。
+    # 無くても生成は動く（プレビューが Latent2RGB になるだけ）ため必須扱い
+    # にはしない。
+    ModelFile("vae_approx", "taeh3.safetensors",
+              "https://huggingface.co/Kijai/MiniMax-H3-TAE/resolve/main/"
+              "vae_approx/taeh3.safetensors",
+              9_791_388, required=False),
 ]
 
 

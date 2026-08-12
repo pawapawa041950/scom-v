@@ -324,6 +324,33 @@ class FirstRunSetup:
             )
             emit(step_id, m.filename, "done", 1.0, "ダウンロード完了")
 
+        # プレビュー用 tiny デコーダ等の小物（vae_approx, 数MB）は選択UIに
+        # 出さず常に取得する。失敗しても続行する（無ければプレビューが
+        # Latent2RGB になるだけで、生成には影響しない）。
+        download_aux_models(self.paths, log, cancel)
+
+
+def download_aux_models(paths: config.AppPaths, log: LogCb,
+                        cancel: Optional[Callable[[], bool]] = None) -> None:
+    """UI に出さない補助モデル（vae_approx）を欠けていれば取得する。"""
+    try:
+        manifest = models.load_manifest(paths)
+    except Exception as e:  # noqa: BLE001
+        log(f"モデル一覧の読み込みに失敗: {e}")
+        return
+    for m in manifest:
+        if m.kind != "vae_approx":
+            continue
+        dest = models.target_path(paths, m)
+        if dest.exists() and (not m.size or dest.stat().st_size == m.size):
+            continue
+        try:
+            log(f"{m.filename}（プレビュー用デコーダ）をダウンロード中…")
+            models.download_model(paths, m, cancel=cancel)
+            log(f"{m.filename} のダウンロード完了")
+        except Exception as e:  # noqa: BLE001
+            log(f"{m.filename} の取得に失敗（生成には影響しません）: {e}")
+
 
 def _fmt_bytes(done: int, total: int) -> str:
     def g(n: int) -> str:

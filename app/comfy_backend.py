@@ -28,6 +28,7 @@ from typing import Callable, Optional
 import websocket  # websocket-client
 
 from . import config
+from .comfy_custom_nodes import ensure_custom_nodes
 from .textutil import strip_ansi
 
 
@@ -44,8 +45,14 @@ def _free_port(preferred: int = 8199) -> int:
 
 
 def write_extra_model_paths(paths: config.AppPaths) -> Path:
-    """Write extra_model_paths.yaml pointing ComfyUI at our models folder."""
+    """Write extra_model_paths.yaml pointing ComfyUI at our models folder.
+
+    Also installs the scom-v custom node (taeh3 preview) and registers its
+    directory — an absolute path passes through ComfyUI's os.path.join with
+    base_path unchanged, so it can live outside the models tree.
+    """
     models = paths.models
+    nodes_dir = ensure_custom_nodes(paths)
     yaml_text = (
         "scomv:\n"
         f"  base_path: {models.as_posix()}\n"
@@ -54,6 +61,8 @@ def write_extra_model_paths(paths: config.AppPaths) -> Path:
         "  vae: vae/\n"
         "  text_encoders: text_encoders/\n"
         "  loras: loras/\n"
+        "  vae_approx: vae_approx/\n"
+        f"  custom_nodes: {nodes_dir.as_posix()}\n"
     )
     out = paths.user_data / "extra_model_paths.yaml"
     out.write_text(yaml_text, encoding="utf-8")
@@ -109,6 +118,10 @@ class ComfyBackend:
             )
 
         config.ensure_model_dirs()
+        # プレビュー用 tiny デコーダが欠けていれば取得を試みる（9.8MB。
+        # 失敗しても続行 — 無い場合は Latent2RGB プレビューで動く）。
+        from .bootstrap.setup import download_aux_models
+        download_aux_models(self.paths, log)
         extra_paths = write_extra_model_paths(self.paths)
         self.port = _free_port(self.port)
 
@@ -120,6 +133,7 @@ class ComfyBackend:
             "--extra-model-paths-config", str(extra_paths),
             "--output-directory", str(self.paths.output_dir),
             "--preview-method", "auto",  # stream latent previews over the ws
+            "--preview-size", "768",     # taeh3 デコードは16倍なので粗くしない
             "--disable-auto-launch",
         ]
         if self.use_sage_attention:
