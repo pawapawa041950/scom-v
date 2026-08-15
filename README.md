@@ -6,15 +6,22 @@ Windowsにおいて1ウィンドウだけでお手軽に**動画生成**する�
 内部ではComfyUIを利用しています。
 モデルは **MiniMax H3**（動画+音声同時生成）に対応しています。
 
-![](img/ss.png)
+<div style="text-align: center;">
+<a href="img/ss1.png"><img src="img/ss1.png" width="500">]</a>
+</div>
 
 ## 特徴
 * リリースビルド版はexe内に必要なpythonも含めているため、Windows11であればexeを実行するだけでComfyUIの環境構築がスタートし、利用できるようになります。
 * t2v（テキストから動画）/ i2v（画像から動画・終端フレーム指定対応）/ r2v（参照画像・動画・音声から生成）の3モードに対応。
-* 音声付き動画（24fps・32kHzステレオ）を生成し、output/ にmp4として保存します。
+* 15秒を超えた長尺動画を作成するためのContex Loopを使用するための専用UIを備えています。
 * モデルは量子化版（int8_convrot / fp8_scaled）をアプリ内からダウンロードできます。
 * 自動連続生成・生成タスクのキューイングに対応しています。
 * 生成の高速化を行うSage Attention、EasyCacheに対応しています。設定からON/OFFできます。
+
+<div style="text-align: center;">
+Contex Loop用UI<br>
+<a href="img/ss2.png"><img src="img/ss2.png" width="500">]</a>
+</div>
 
 ## 動作要件
 * NVIDIA GPU（VRAM 16GB以上推奨）

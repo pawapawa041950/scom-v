@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
 
@@ -111,6 +112,10 @@ class GenParams:
     ref_videos: list[dict] = field(default_factory=list)
     ref_audios: list[str] = field(default_factory=list)   # 最大3
     filename_prefix: str = "video/scomv"
+    # ContexLoop（長尺チェーン）の設定。mode == "chain" のとき必須。
+    # ChainDialog.plan() の辞書に、参照/開始フレームをアップロード済み
+    # ファイル名へ差し替えたものを入れる。
+    chain: dict | None = None
 
 
 def build_graph(p: GenParams) -> dict:
@@ -123,6 +128,8 @@ def build_graph(p: GenParams) -> dict:
         raise ValueError("動画 VAE を選択してください")
     if not p.vae_audio:
         raise ValueError("音声 VAE を選択してください")
+    if p.mode == "chain":
+        return build_chain_graph(p)
     if p.mode not in ("t2v", "i2v", "r2v"):
         raise ValueError(f"不明なモードです: {p.mode}")
     if p.mode == "i2v" and not p.first_frame and not p.last_frame:
@@ -264,4 +271,291 @@ def build_graph(p: GenParams) -> dict:
                "inputs": {"video": ["14", 0],
                           "filename_prefix": p.filename_prefix,
                           "format": "auto", "codec": "auto"}}
+    return g
+
+
+# ----- ContexLoop（長尺チェーン）------------------------------------------
+# サードパーティのカスタムノードパック ComfyUI-MiniMaxH3-Contex-Loop を使う。
+# 1回のプロンプト実行でグラフが再帰展開され、全シーンが順に生成される:
+#
+#   Plan → LoopStart ─flow──────────────────────────────────────┐
+#            └→ Current ─┬→ (FirstSceneImage) → 条件付けノード  │
+#                        ├→ RandomNoise / BasicScheduler        │
+#                        └→ Context → BasicGuider → Sampler     │
+#                             → VAEDecode(+Audio) → LoopTrim    │
+#                             → SegmentSave → LoopEnd ──────────┘
+#                                                └→ Assemble（結合mp4）
+CHAIN_ENCODE_MODE = "video"
+CHAIN_ANCHOR_MODE = "head"
+CHAIN_CROP = "disabled"
+CHAIN_MAX_SHOTS = 128
+
+
+def chain_plan_json(chain: dict) -> str:
+    """ChainDialog の設定を Plan ノードの plan_json 文字列にする。"""
+    shots = []
+    for s in chain.get("shots", []):
+        shot: dict = {
+            "id": str(s.get("id") or "").strip(),
+            "prompt": str(s.get("prompt") or ""),
+            "duration_seconds": float(s.get("duration_seconds") or 5.0),
+        }
+        if int(s.get("steps") or 0) > 0:
+            shot["steps"] = int(s["steps"])
+        seed = str(s.get("seed") or "").strip()
+        if seed:
+            shot["seed"] = seed
+        shots.append(shot)
+    doc: dict = {"shots": shots}
+    prefix = str(chain.get("prompt_prefix") or "")
+    if prefix.strip():
+        doc["prompt_prefix"] = prefix
+    return json.dumps(doc, ensure_ascii=False)
+
+
+def chain_frames(chain: dict) -> tuple[int, int]:
+    """(生成フレーム合計, 実尺フレーム) を返す（引き継ぎ分を差し引く）。"""
+    raw = [frames_for_seconds(float(s.get("duration_seconds") or 5.0))
+           for s in chain.get("shots", [])]
+    ctx = int(chain.get("context_length") or 22)
+    return sum(raw), sum(raw) - ctx * max(0, len(raw) - 1)
+
+
+def validate_chain(chain: dict) -> None:
+    """生成前チェック（UI からも呼べるよう公開）。"""
+    shots = chain.get("shots") or []
+    if not shots:
+        raise ValueError("シーンが1つもありません")
+    if len(shots) > CHAIN_MAX_SHOTS:
+        raise ValueError(f"シーンは最大 {CHAIN_MAX_SHOTS} 個です")
+    prefix = str(chain.get("prompt_prefix") or "").strip()
+    for i, s in enumerate(shots, 1):
+        if not str(s.get("prompt") or "").strip() and not prefix:
+            raise ValueError(f"シーン {i} のプロンプトが空です")
+    ids = [str(s.get("id") or "").strip() for s in shots]
+    if "" in ids:
+        raise ValueError("シーン ID が空のものがあります")
+    if len(set(ids)) != len(ids):
+        raise ValueError("シーン ID が重複しています")
+    ctx = int(chain.get("context_length") or 22)
+    raw = [frames_for_seconds(float(s.get("duration_seconds") or 5.0))
+           for s in shots]
+    short = [i for i, f in enumerate(raw[:-1], 1) if f <= ctx]
+    if short:
+        raise ValueError(
+            "シーン " + ", ".join(map(str, short))
+            + f" は引き継ぎフレーム数（{ctx}）以下のため生成できません")
+    kind = chain.get("chain_type")
+    if kind == "i2v" and not str(shots[0].get("first_frame") or "").strip():
+        raise ValueError("i2v チェーンにはシーン1の開始フレーム画像が必要です")
+    if kind == "r2v" and not chain.get("references"):
+        raise ValueError("r2v チェーンには参照素材が1つ以上必要です")
+    if (chain.get("audio_mode") in ("source_track", "source_plus_timeline")
+            and not str(chain.get("audio_file") or "").strip()):
+        raise ValueError("この音声モードには外部音源ファイルが必要です")
+
+
+def build_chain_graph(p: GenParams) -> dict:
+    """ContexLoop の長尺チェーン用 API グラフを組み立てる。"""
+    chain = p.chain or {}
+    validate_chain(chain)
+    kind = chain.get("chain_type") or "t2v"
+
+    g: dict[str, dict] = {}
+    g["1"] = {"class_type": "UNETLoader",
+              "inputs": {"unet_name": p.diffusion,
+                         "weight_dtype": p.weight_dtype}}
+    g["2"] = {"class_type": "CLIPLoader",
+              "inputs": {"clip_name": p.te, "type": "minimax",
+                         "device": "default"}}
+    g["3"] = {"class_type": "VAELoader", "inputs": {"vae_name": p.vae_video}}
+    g["4"] = {"class_type": "VAELoader", "inputs": {"vae_name": p.vae_audio}}
+
+    model_src: list = ["1", 0]
+    clip_src: list = ["2", 0]
+    for i, (lora_name, strength) in enumerate(p.loras):
+        if not lora_name:
+            raise ValueError("LoRA のファイル名が空です")
+        nid = str(60 + i)
+        g[nid] = {"class_type": "LoraLoader",
+                  "inputs": {"lora_name": lora_name,
+                             "strength_model": float(strength),
+                             "strength_clip": float(strength),
+                             "model": model_src, "clip": clip_src}}
+        model_src = [nid, 0]
+        clip_src = [nid, 1]
+    if p.shift_enabled:
+        g["6"] = {"class_type": "MiniMaxH3SigmaShift",
+                  "inputs": {"model": model_src,
+                             "shift_video": float(p.shift_video),
+                             "shift_audio": float(p.shift_audio)}}
+        model_src = ["6", 0]
+    if p.easycache_enabled:
+        g["17"] = {"class_type": "EasyCache",
+                   "inputs": {"model": model_src,
+                              "reuse_threshold": float(p.easycache_threshold),
+                              "start_percent": 0.15, "end_percent": 0.95,
+                              "verbose": False}}
+        model_src = ["17", 0]
+
+    # ----- チェーン制御 ----------------------------------------------------
+    g["100"] = {"class_type": "MiniMaxH3ChainPlan", "inputs": {
+        "plan_json": chain_plan_json(chain),
+        "run_name": str(chain.get("run_name") or "h3_chain"),
+        "generation_fingerprint": "",
+        "width": int(p.width),
+        "height": int(p.height),
+        "context_length": int(chain.get("context_length") or 22),
+        "encode_mode": CHAIN_ENCODE_MODE,
+        "anchor_mode": CHAIN_ANCHOR_MODE,
+        "crop": CHAIN_CROP,
+        "audio_mode": str(chain.get("audio_mode") or "generated_audio"),
+        "audio_context_length": int(chain.get("audio_context_length") or 22),
+        "default_duration_seconds": 15.0,
+        "default_steps": int(chain.get("default_steps") or p.steps),
+        "base_seed": int(str(chain.get("base_seed") or "0") or 0),
+        "segment_crf": int(chain.get("segment_crf") or 18),
+    }}
+
+    start_inputs: dict = {"plan": ["100", 0], "start_clip": 1,
+                          "scene_range": str(chain.get("scene_range") or "")}
+    audio_file = str(chain.get("audio_file") or "").strip()
+    if audio_file:
+        g["150"] = {"class_type": "LoadAudio", "inputs": {"audio": audio_file}}
+        start_inputs["source_audio"] = ["150", 0]
+    g["101"] = {"class_type": "MiniMaxH3ChainLoopStart", "inputs": start_inputs}
+
+    cur_inputs: dict = {"state": ["101", 1]}
+    if audio_file:
+        cur_inputs["source_audio"] = ["150", 0]
+    g["102"] = {"class_type": "MiniMaxH3ChainCurrent", "inputs": cur_inputs}
+
+    # ----- 条件付け（シーンごとの値は Current から流れる）------------------
+    if kind == "r2v":
+        # 参照スケジュール: 各素材を previous で数珠つなぎにする。
+        prev: list | None = None
+        nid = 140
+        for ref in chain.get("references", []):
+            name = str(ref.get("name") or "")
+            if not name:
+                continue
+            tag = str(ref.get("tag") or "")
+            scenes = str(ref.get("scenes") or "") or "all"
+            rkind = ref.get("kind")
+            if rkind == "image":
+                load = str(nid); nid += 1
+                node = str(nid); nid += 1
+                g[load] = {"class_type": "LoadImage",
+                           "inputs": {"image": name}}
+                ins = {"image": [load, 0], "tag": tag, "scenes": scenes}
+                if prev:
+                    ins["previous"] = prev
+                g[node] = {"class_type": "MiniMaxH3ScheduledPictureReference",
+                           "inputs": ins}
+            elif rkind == "video":
+                load = str(nid); nid += 1
+                prep = str(nid); nid += 1
+                node = str(nid); nid += 1
+                g[load] = {"class_type": "LoadVideo",
+                           "inputs": {"file": name}}
+                # 参照動画は H3 有効長（17n+5）へ整える。既定 209f ≒ 8.7秒。
+                g[prep] = {"class_type": "MiniMaxH3ReferenceVideoPrepare",
+                           "inputs": {"source_video": [load, 0],
+                                      "length": int(ref.get("length") or 209),
+                                      "source_fps": float(FPS)}}
+                ins = {"video": [prep, 0], "audio": [prep, 1],
+                       "tag": tag, "scenes": scenes,
+                       "audio_tag": tag + "_audio"}
+                if prev:
+                    ins["previous"] = prev
+                g[node] = {"class_type": "MiniMaxH3ScheduledVideoReference",
+                           "inputs": ins}
+            else:
+                load = str(nid); nid += 1
+                node = str(nid); nid += 1
+                g[load] = {"class_type": "LoadAudio",
+                           "inputs": {"audio": name}}
+                ins = {"audio": [load, 0], "tag": tag, "scenes": scenes}
+                if prev:
+                    ins["previous"] = prev
+                g[node] = {"class_type": "MiniMaxH3ScheduledAudioReference",
+                           "inputs": ins}
+            prev = [node, 0]
+        if prev is None:
+            raise ValueError("r2v チェーンには参照素材が1つ以上必要です")
+        g["110"] = {"class_type": "MiniMaxH3ScheduledReferenceToVideo",
+                    "inputs": {
+                        "clip": clip_src, "vae": ["3", 0],
+                        "audio_vae": ["4", 0],
+                        "reference_schedule": prev,
+                        "clip_index": ["102", 1],
+                        "clip_count": ["102", 2],
+                        "prompt": ["102", 4],
+                        "width": ["102", 8],
+                        "height": ["102", 9],
+                        "length": ["102", 6],
+                        "ref_image_size": str(p.ref_image_size or "match"),
+                    }}
+    else:
+        inputs: dict = {
+            "clip": clip_src, "vae": ["3", 0],
+            "prompt": ["102", 4],
+            "width": ["102", 8],
+            "height": ["102", 9],
+            "length": ["102", 6],
+        }
+        if kind == "i2v":
+            first = str(chain["shots"][0].get("first_frame") or "").strip()
+            g["108"] = {"class_type": "LoadImage", "inputs": {"image": first}}
+            # シーン1にだけ開始フレームを通す（2シーン目以降は渡らない）。
+            g["107"] = {"class_type": "MiniMaxH3ChainFirstSceneImage",
+                        "inputs": {"state": ["102", 0], "image": ["108", 0]}}
+            inputs["first_frame"] = ["107", 0]
+        g["110"] = {"class_type": "MiniMaxH3ImageToVideo", "inputs": inputs}
+
+    # ----- 文脈の適用 → サンプリング ---------------------------------------
+    g["103"] = {"class_type": "MiniMaxH3ChainContext",
+                "inputs": {"state": ["102", 0], "conditioning": ["110", 0],
+                           "vae": ["3", 0], "latent": ["110", 1],
+                           "audio_vae": ["4", 0]}}
+    g["120"] = {"class_type": "RandomNoise",
+                "inputs": {"noise_seed": ["102", 5]}}
+    g["121"] = {"class_type": "BasicGuider",
+                "inputs": {"model": model_src, "conditioning": ["103", 0]}}
+    g["122"] = {"class_type": "KSamplerSelect",
+                "inputs": {"sampler_name": p.sampler}}
+    g["123"] = {"class_type": "BasicScheduler",
+                "inputs": {"model": model_src, "scheduler": p.scheduler,
+                           "steps": ["102", 7], "denoise": 1.0}}
+    g["124"] = {"class_type": "SamplerCustomAdvanced",
+                "inputs": {"noise": ["120", 0], "guider": ["121", 0],
+                           "sampler": ["122", 0], "sigmas": ["123", 0],
+                           "latent_image": ["110", 1]}}
+    g["130"] = {"class_type": "VAEDecode",
+                "inputs": {"samples": ["124", 0], "vae": ["3", 0]}}
+    g["131"] = {"class_type": "VAEDecodeAudio",
+                "inputs": {"samples": ["124", 0], "vae": ["4", 0]}}
+    g["132"] = {"class_type": "MiniMaxH3LoopTrim",
+                "inputs": {"images": ["130", 0], "audio": ["131", 0],
+                           "trim_frames": ["103", 1], "fps": float(FPS),
+                           "match_tail": True}}
+
+    # ----- 保存 → 次シーンへ再帰 → 結合 -----------------------------------
+    g["104"] = {"class_type": "MiniMaxH3ChainSegmentSave",
+                "inputs": {"state": ["102", 0], "images": ["132", 0],
+                           "sampled_latent": ["124", 0],
+                           "audio": ["132", 1]}}
+    # レビュー（人手承認）は使わず SegmentSave を LoopEnd に直結する。
+    g["105"] = {"class_type": "MiniMaxH3ChainLoopEnd",
+                "inputs": {"flow": ["101", 0], "state": ["102", 0],
+                           "images": ["132", 0],
+                           "sampled_latent": ["124", 0],
+                           "segment": ["104", 0]}}
+    asm: dict = {"manifest": ["105", 0],
+                 "audio_source": "plan",
+                 "filename": str(chain.get("final_name") or "final"),
+                 "audio_bitrate": int(chain.get("audio_bitrate") or 256)}
+    if audio_file:
+        asm["source_audio"] = ["150", 0]
+    g["106"] = {"class_type": "MiniMaxH3ChainAssemble", "inputs": asm}
     return g

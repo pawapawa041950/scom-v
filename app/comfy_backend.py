@@ -11,6 +11,7 @@ Responsibilities:
 from __future__ import annotations
 
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -67,6 +68,11 @@ def write_extra_model_paths(paths: config.AppPaths) -> Path:
     out = paths.user_data / "extra_model_paths.yaml"
     out.write_text(yaml_text, encoding="utf-8")
     return out
+
+
+# ノードのテキスト出力に現れる動画の絶対パス（ContexLoop の Assemble 用）。
+_VIDEO_PATH_RE = re.compile(
+    r'[A-Za-z]:\\[^\r\n"<>|?*]+?\.(?:mp4|mkv|webm|mov)')
 
 
 @dataclass
@@ -258,11 +264,20 @@ class ComfyBackend:
         entry = history.get(prompt_id, {})
         out_dir = self.paths.output_dir
         files: list[Path] = []
+        # ContexLoop の Assemble は {filename} ではなく完成パスを含む文字列を
+        # 返すため、テキスト出力からも動画パスを拾う（新しい順 = 最終結合物）。
+        from_text: list[Path] = []
         for node_out in entry.get("outputs", {}).values():
             for items in node_out.values():
                 if not isinstance(items, list):
                     continue
                 for it in items:
+                    if isinstance(it, str):
+                        for m in _VIDEO_PATH_RE.finditer(it):
+                            q = Path(m.group(0))
+                            if q.exists() and q not in from_text:
+                                from_text.append(q)
+                        continue
                     if not (isinstance(it, dict) and it.get("filename")):
                         continue
                     if it.get("type", "output") != "output":
@@ -270,6 +285,10 @@ class ComfyBackend:
                     p = out_dir / it.get("subfolder", "") / it["filename"]
                     if p.exists() and p not in files:
                         files.append(p)
+        for q in sorted(from_text, key=lambda x: x.stat().st_mtime,
+                        reverse=True):
+            if q not in files:
+                files.append(q)
         return files
 
     def upload_input_file(self, path: Path) -> str:

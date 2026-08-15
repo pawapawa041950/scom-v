@@ -49,7 +49,8 @@ _LORA_INSERT_FG = QColor("#22456e")   # 濃い文字色
 
 MODES = [("t2v", "テキストから動画 (t2v)"),
          ("i2v", "画像から動画 (i2v)"),
-         ("r2v", "参照から動画 (r2v)")]
+         ("r2v", "参照から動画 (r2v)"),
+         ("chain", "長尺チェーン (ContexLoop)")]
 
 _IMAGE_FILTER = "画像 (*.png *.jpg *.jpeg *.webp *.bmp);;すべて (*.*)"
 _VIDEO_FILTER = "動画 (*.mp4 *.webm *.mkv *.mov *.avi);;すべて (*.*)"
@@ -156,6 +157,9 @@ class MainWindow(QMainWindow):
         # 同じ参照ファイルを毎回アップロードし直さないため。
         self._upload_cache: dict[str, tuple[float, str]] = {}
         self._all_models: dict[str, list[str]] = {}
+        # ContexLoop の設定（専用ウィンドウが保持する plan 辞書）。
+        self._chain_plan: Optional[dict] = None
+        self._chain_dlg = None
         # 適用中 LoRA（チェックポイント別に記憶: fl2va = t2v/i2v, ref2va = r2v。
         # scom と同様、アプリ再起動では保存しない）。
         self._loras_by_family: dict[str, list[dict]] = {
@@ -248,7 +252,7 @@ class MainWindow(QMainWindow):
         lv.addWidget(self._build_speed_box())
 
         # Prompt（中央ペイン下段）
-        box_prompt = QGroupBox("Prompt")
+        box_prompt = self.box_prompt = QGroupBox("Prompt")
         pv = QVBoxLayout(box_prompt)
         # 公式推奨のプロンプトは350〜500語と長くなるため、一定行数を超えたら
         # スクロールバー表示に切り替えてウィンドウの肥大化を防ぐ。
@@ -296,6 +300,7 @@ class MainWindow(QMainWindow):
         self.stack_mode.addWidget(self._build_t2v_page())
         self.stack_mode.addWidget(self._build_i2v_page())
         self.stack_mode.addWidget(self._build_r2v_page())
+        self.stack_mode.addWidget(self._build_chain_page())
         lv.addWidget(self.stack_mode)
         lv.addStretch(1)
 
@@ -372,6 +377,26 @@ class MainWindow(QMainWindow):
         self.status.addPermanentWidget(self.lbl_gen_time)
         self.status.addPermanentWidget(self.progress)
         self.status.showMessage("バックエンドを起動中…")
+
+    def _build_chain_page(self) -> QWidget:
+        """ContexLoop モード: 専用ウィンドウを開くボタンと概要だけを置く。"""
+        page = QGroupBox("長尺チェーン (ContexLoop)")
+        v = QVBoxLayout(page)
+        note = QLabel(
+            "15秒を超える動画を、シーンをつないで生成します。"
+            "シーン・参照・音声の設定は専用ウィンドウで行います。")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#888;")
+        v.addWidget(note)
+        self.btn_chain = QPushButton("チェーン設定を開く…")
+        self.btn_chain.setMinimumHeight(34)
+        self.btn_chain.clicked.connect(self.open_chain_dialog)
+        v.addWidget(self.btn_chain)
+        self.lbl_chain = QLabel("")
+        self.lbl_chain.setWordWrap(True)
+        v.addWidget(self.lbl_chain)
+        v.addStretch(1)
+        return page
 
     def _build_t2v_page(self) -> QWidget:
         page = QWidget()
@@ -776,7 +801,11 @@ class MainWindow(QMainWindow):
     def _on_mode_changed(self, *_a) -> None:
         mode = self._mode()
         self.stack_mode.setCurrentIndex(
-            {"t2v": 0, "i2v": 1, "r2v": 2}[mode])
+            {"t2v": 0, "i2v": 1, "r2v": 2, "chain": 3}[mode])
+        # チェーンではシーンごとのプロンプトを専用ウィンドウで編集するので、
+        # メイン側のプロンプト欄は隠す。
+        self.box_prompt.setVisible(mode != "chain")
+        self._update_chain_summary()
         self.lbl_diffusion.setText(
             "Diffusion (ref2va):" if mode == "r2v" else "Diffusion (fl2va):")
         # アスペクト比の有効/無効（i2v・手動で無効）とサイズ再計算。
@@ -897,6 +926,104 @@ class MainWindow(QMainWindow):
         dlg = ModelsDialog(self.paths, parent=self)
         dlg.exec()
         self.refresh_models()
+
+    # ----- ContexLoop（長尺チェーン）---------------------------------------
+    def _ensure_contex_loop(self) -> bool:
+        """チェーン用のカスタムノードパックを確認し、無ければ確認して導入。"""
+        from ..comfy_custom_nodes import (
+            CONTEX_LOOP_REPO, CONTEX_LOOP_VERSION, contex_loop_installed,
+            install_contex_loop,
+        )
+        if contex_loop_installed(self.paths):
+            return True
+        ret = QMessageBox.question(
+            self, "ContexLoop",
+            "長尺チェーンには第三者製の追加コンポーネントが必要です。\n"
+            f"{CONTEX_LOOP_REPO} ({CONTEX_LOOP_VERSION}) を"
+            "ダウンロードしますか？\n"
+            "（導入後、反映にはアプリの再起動が必要です）",
+            QMessageBox.Yes | QMessageBox.Cancel)
+        if ret != QMessageBox.Yes:
+            return False
+        try:
+            install_contex_loop(self.paths, self.append_log)
+        except Exception as e:  # noqa: BLE001
+            self.append_log(f"ContexLoop の導入に失敗: {e}")
+            QMessageBox.warning(self, "ContexLoop",
+                                f"導入に失敗しました:\n{e}")
+            return False
+        QMessageBox.information(
+            self, "ContexLoop",
+            "追加コンポーネントを導入しました。\n"
+            "反映にはアプリの再起動が必要です。")
+        return True
+
+    def open_chain_dialog(self) -> None:
+        """チェーン設定ウィンドウを開く（非モーダル・1個だけ）。"""
+        if not self._ensure_contex_loop():
+            return
+        if self._chain_dlg is None:
+            from .chain_dialog import ChainDialog
+            dlg = ChainDialog(parent=self)
+            if self._chain_plan:
+                dlg.load_plan(self._chain_plan)
+            dlg.changed.connect(self._update_chain_summary)
+            # 閉じても設定は保持する（次に開くと続きから編集できる）。
+            dlg.finished.connect(self._on_chain_dialog_closed)
+            self._chain_dlg = dlg
+        self._chain_dlg.show()
+        self._chain_dlg.raise_()
+        self._chain_dlg.activateWindow()
+        self._update_chain_summary()
+
+    def _on_chain_dialog_closed(self, *_a) -> None:
+        if self._chain_dlg is not None:
+            self._chain_plan = self._chain_dlg.plan()
+        self._update_chain_summary()
+
+    def _current_chain_plan(self) -> Optional[dict]:
+        """生成時に使う設定。ウィンドウが開いていればその場の内容を使う。"""
+        if self._chain_dlg is not None:
+            return self._chain_dlg.plan()
+        return self._chain_plan
+
+    def _update_chain_summary(self) -> None:
+        if self._mode() != "chain" or not hasattr(self, "lbl_chain"):
+            return
+        plan = self._current_chain_plan()
+        if not plan:
+            self.lbl_chain.setText("未設定（ボタンから設定してください）")
+            self.lbl_chain.setStyleSheet("color:#c33;")
+            return
+        _raw, delivered = workflow.chain_frames(plan)
+        kind = {"i2v": "画像から開始", "r2v": "参照から生成",
+                "t2v": "プロンプトのみ"}.get(plan.get("chain_type"), "")
+        try:
+            workflow.validate_chain(plan)
+            warn = ""
+            self.lbl_chain.setStyleSheet("color:#888;")
+        except ValueError as e:
+            warn = f"\n⚠ {e}"
+            self.lbl_chain.setStyleSheet("color:#c33;")
+        self.lbl_chain.setText(
+            f"{plan.get('run_name')} / {kind} / "
+            f"{len(plan.get('shots', []))} シーン / "
+            f"実尺 {delivered / workflow.FPS:.1f} 秒" + warn)
+
+    def _upload_chain_files(self, plan: dict) -> dict:
+        """チェーン設定内のローカルパスをアップロード済み名へ置き換える。"""
+        out = dict(plan)
+        out["shots"] = [dict(s) for s in plan.get("shots", [])]
+        out["references"] = [dict(r) for r in plan.get("references", [])]
+        if out["shots"] and out["shots"][0].get("first_frame"):
+            out["shots"][0]["first_frame"] = self._upload(
+                out["shots"][0]["first_frame"])
+        for ref in out["references"]:
+            if ref.get("path"):
+                ref["name"] = self._upload(ref["path"])
+        if out.get("audio_file"):
+            out["audio_file"] = self._upload(out["audio_file"])
+        return out
 
     # ----- LoRA ------------------------------------------------------------
     def _lora_family(self) -> str:
@@ -1448,6 +1575,18 @@ class MainWindow(QMainWindow):
             aw, ah = self.cb_aspect.currentData() or (16, 9)
             width, height = size_for_aspect(aw, ah, mp)
 
+        chain = None
+        if mode == "chain":
+            # 「生成」を押した時点のチェーン設定をそのまま使う。
+            plan = self._current_chain_plan()
+            if not plan:
+                raise ValueError(
+                    "チェーンが未設定です。「チェーン設定を開く…」から"
+                    "シーンを作成してください")
+            workflow.validate_chain(plan)
+            self._chain_plan = plan
+            chain = self._upload_chain_files(plan)
+
         ref_images: list[str] = []
         ref_videos: list[dict] = []
         ref_audios: list[str] = []
@@ -1485,6 +1624,7 @@ class MainWindow(QMainWindow):
             shift_audio=float(self.sp_shift_audio.value()),
             loras=[(e["name"], float(e["strength"]))
                    for e in self._current_loras()],
+            chain=chain,
             easycache_enabled=self.chk_easycache.isChecked(),
             easycache_threshold=float(self.sp_easycache.value()),
             first_frame=first,
@@ -1530,10 +1670,20 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setEnabled(True)
         self.progress.setValue(0)
         self.status.showMessage("生成中…")
-        secs = params.frames / workflow.FPS
-        self.append_log(
-            f"生成 [{params.mode}] seed={params.seed} "
-            f"{params.width}x{params.height} {params.frames}f ({secs:.1f}s)")
+        if params.mode == "chain" and params.chain:
+            raw, delivered = workflow.chain_frames(params.chain)
+            self.append_log(
+                f"生成 [chain] {params.chain.get('run_name')} "
+                f"{len(params.chain.get('shots', []))} シーン "
+                f"{params.width}x{params.height} "
+                f"生成 {raw}f / 実尺 {delivered}f "
+                f"({delivered / workflow.FPS:.1f}s)")
+        else:
+            secs = params.frames / workflow.FPS
+            self.append_log(
+                f"生成 [{params.mode}] seed={params.seed} "
+                f"{params.width}x{params.height} {params.frames}f "
+                f"({secs:.1f}s)")
 
         self._gen_thread = QThread(self)
         # mp4 のメタデータは ComfyUI 標準（workflow JSON）に任せ、生成アプリ
@@ -1685,6 +1835,8 @@ class MainWindow(QMainWindow):
             self._schedule_save()
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt signature)
+        if self._chain_dlg is not None:
+            self._chain_dlg.close()
         if self._gen_worker:
             self._gen_worker.cancel()
         try:
