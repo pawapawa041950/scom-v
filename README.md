@@ -6,8 +6,8 @@ Windowsにおいて1ウィンドウだけでお手軽に**動画生成**する�
 内部ではComfyUIを利用しています。
 モデルは **MiniMax H3**（動画+音声同時生成）に対応しています。
 
-<div style="text-align: center;">
-<a href="img/ss1.png"><img src="img/ss1.png" width="500">]</a>
+<div align="center">
+<a href="img/ss1.png"><img src="img/ss1.png" width="500"></a>
 </div>
 
 ## 特徴
@@ -18,9 +18,9 @@ Windowsにおいて1ウィンドウだけでお手軽に**動画生成**する�
 * 自動連続生成・生成タスクのキューイングに対応しています。
 * 生成の高速化を行うSage Attention、EasyCacheに対応しています。設定からON/OFFできます。
 
-<div style="text-align: center;">
+<div align="center">
 Contex Loop用UI<br>
-<a href="img/ss2.png"><img src="img/ss2.png" width="500">]</a>
+<a href="img/ss2.png"><img src="img/ss2.png" width="500"></a>
 </div>
 
 ## 動作要件
