@@ -416,6 +416,7 @@ class MainWindow(QMainWindow):
         self.ed_first_frame.setReadOnly(True)
         self.ed_last_frame = QLineEdit()
         self.ed_last_frame.setReadOnly(True)
+        self._last_frame_widgets: list = []
         for i, (label, ed, tip) in enumerate((
             ("開始フレーム:", self.ed_first_frame,
              "動画の最初のフレームになる画像"),
@@ -440,9 +441,37 @@ class MainWindow(QMainWindow):
             row.addWidget(btn_clr)
             row.addStretch(1)
             v.addLayout(row)
+            if i:
+                # 終端フレーム側は「開始と同じ」ON でまとめてグレーアウトする。
+                self._last_frame_widgets += [lbl, ed, btn_sel, btn_clr]
+        # 開始と終端に同じ画像を使うオプション（ループ動画向け）。
+        self.chk_same_frame = QCheckBox("終端フレームに開始フレームと同じ画像を使う")
+        self.chk_same_frame.setToolTip(
+            "ON にすると終端フレームは開始フレームと同じ画像になります"
+            "（先頭と末尾がつながるループ的な動画向け）")
+        self.chk_same_frame.toggled.connect(self._on_same_frame_toggled)
+        v.addWidget(self.chk_same_frame)
         v.addStretch(1)
         self.ed_first_frame.textChanged.connect(self._update_size_label)
+        self.ed_first_frame.textChanged.connect(self._sync_same_frame)
         return page
+
+    def _on_same_frame_toggled(self, checked: bool) -> None:
+        for w in getattr(self, "_last_frame_widgets", []):
+            w.setEnabled(not checked)
+        if checked:
+            self._saved_last_frame = self.ed_last_frame.text()
+        self._sync_same_frame()
+        if not checked:
+            # 手動指定に戻すときは、ON にする前の値を復元する。
+            self.ed_last_frame.setText(getattr(self, "_saved_last_frame", ""))
+        self._schedule_save()
+
+    def _sync_same_frame(self, *_a) -> None:
+        if getattr(self, "chk_same_frame", None) is None:
+            return
+        if self.chk_same_frame.isChecked():
+            self.ed_last_frame.setText(self.ed_first_frame.text())
 
     def _build_r2v_page(self) -> QWidget:
         page = QGroupBox("r2v 参照")
@@ -1405,6 +1434,8 @@ class MainWindow(QMainWindow):
         self.sp_easycache.setValue(float(s.get("easycache_threshold", 0.2)))
         if self.chk_sage.isEnabled():
             self.chk_sage.setChecked(bool(s.get("sage_attention", False)))
+        self.chk_same_frame.setChecked(
+            bool(s.get("same_first_last_frame", False)))
         ri = self.cb_ref_size.findData(str(s.get("ref_image_size", "match")))
         if ri >= 0:
             self.cb_ref_size.setCurrentIndex(ri)
@@ -1485,6 +1516,7 @@ class MainWindow(QMainWindow):
             "shift_audio": float(self.sp_shift_audio.value()),
             "easycache_enabled": self.chk_easycache.isChecked(),
             "easycache_threshold": float(self.sp_easycache.value()),
+            "same_first_last_frame": self.chk_same_frame.isChecked(),
             "ref_image_size": self.cb_ref_size.currentData() or "match",
         }
         # ジオメトリはウィンドウ表示後のみ保存する。未表示（起動処理中）の

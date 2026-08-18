@@ -44,6 +44,8 @@ DEFAULTS: dict[str, Any] = {
     # EasyCache 高速化（ステップスキップ。閾値が大きいほど速いが品質低下）
     "easycache_enabled": False,
     "easycache_threshold": 0.2,
+    # i2v: 終端フレームに開始フレームと同じ画像を使う
+    "same_first_last_frame": False,
     # r2v
     "ref_image_size": "match",
     # SageAttention（量子化attentionによる高速化）。ONでもパッケージ未導入なら
