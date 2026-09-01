@@ -1722,6 +1722,8 @@ class MainWindow(QMainWindow):
         # の識別用に software タグだけを追加する。
         self._gen_worker = _GenWorker(
             self.backend, graph,
+            # チェーンの成果物は SaveVideo を通らないが、注入した
+            # カスタムノードが Contex Loop 側の書き出しに同じタグを混ぜる。
             extra_pnginfo={"software": config.APP_SIGNATURE})
         self._gen_worker.moveToThread(self._gen_thread)
         self._gen_thread.started.connect(self._gen_worker.run)
