@@ -57,6 +57,19 @@ DEFAULT_MODELS: list[ModelFile] = [
         5_207_808_496, required=True),
     _h3("vae", "minimax_h3_audio_vae_fp32.safetensors",
         605_254_808, required=True),
+    # --- text encoder nvfp4 版（15.7GB。Blackwell 不要と公式 README に明記。
+    #     公式テンプレートの既定。int8 版より 11GB 軽い）--------------------
+    _h3("text_encoders", "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        15_687_142_551),
+    # --- Turbo (PDD) LoRA: 4〜8 ステップの蒸留 LoRA（各 1.96GB）-------------
+    #     fl2v = t2v/i2v 用、ref2v = r2v 用。公式テンプレは fl2v 8step を
+    #     4 ステップで使う。
+    _h3("loras", "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+        1_956_193_000),
+    _h3("loras", "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
+        1_956_192_992),
+    _h3("loras", "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        1_956_193_000),
     # --- プレビュー用 tiny デコーダ（コミュニティ製、9.8MB）------------------
     # サンプリング中プレビューを Latent2RGB より大幅に高品質化する。
     # 選択UIには出さず、セットアップ時と通常起動時に自動取得する。
@@ -67,6 +80,23 @@ DEFAULT_MODELS: list[ModelFile] = [
               "vae_approx/taeh3.safetensors",
               9_791_388, required=False),
 ]
+
+
+# Turbo LoRA のファイル名（チェックポイント系統 × 種類）。
+TURBO_LORAS = {
+    ("fl2va", "8step"): "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+    ("fl2va", "4step_768p"): "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
+    ("ref2va", "4step"): "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+}
+TE_NVFP4 = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+
+
+def turbo_lora_for(ckpt_kind: str, variant: str) -> str:
+    """チェックポイント系統（fl2va / ref2va）と版から Turbo LoRA 名を返す。
+    ref2va は 4step 版しか無いので variant は無視する。"""
+    if ckpt_kind == "ref2va":
+        return TURBO_LORAS[("ref2va", "4step")]
+    return TURBO_LORAS.get(("fl2va", variant), TURBO_LORAS[("fl2va", "8step")])
 
 
 def _write_manifest(mf: Path, manifest: list[ModelFile]) -> None:

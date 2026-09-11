@@ -44,6 +44,15 @@ DEFAULTS: dict[str, Any] = {
     # EasyCache 高速化（ステップスキップ。閾値が大きいほど速いが品質低下）
     "easycache_enabled": False,
     "easycache_threshold": 0.2,
+    # Turbo (PDD) LoRA: 少ステップ蒸留。ON の間は steps を turbo_steps で上書き
+    "turbo_enabled": False,
+    "turbo_steps": 4,
+    "turbo_variant": "8step",      # fl2v 用: 8step | 4step_768p（r2v は 4step 固定）
+    # Sparse Attention（H3 専用 block-sparse。長尺・高解像度向け、品質と交換）
+    "sparse_enabled": False,
+    "sparse_method": "sol-attn",   # sol-attn | sla | vsa
+    # r2v: 参照を VAE に通さずテキストエンコーダだけで効かせる（高速・同一性弱め）
+    "ref_te_only": False,
     # i2v: 終端フレームに開始フレームと同じ画像を使う
     "same_first_last_frame": False,
     # r2v

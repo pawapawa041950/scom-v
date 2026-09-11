@@ -16,7 +16,9 @@ Windowsにおいて1ウィンドウだけでお手軽に**動画生成**する�
 * 15秒を超えた長尺動画を作成するためのContex Loopを使用するための専用UIを備えています。
 * モデルは量子化版（int8_convrot / fp8_scaled）をアプリ内からダウンロードできます。
 * 自動連続生成・生成タスクのキューイングに対応しています。
-* 生成の高速化を行うSage Attention、EasyCacheに対応しています。設定からON/OFFできます。
+* 生成の高速化を行うSage Attention、EasyCache、Turbo LoRA（公式の4〜8ステップ蒸留LoRA）、Sparse Attentionに対応しています。設定からON/OFFできます。
+* 軽量なnvfp4版テキストエンコーダ（15.7GB）もアプリ内からダウンロードできます。
+* r2vの「TEのみ参照」（VAEを通さない高速参照）、任意フレームへ画像・音声を固定するガイド機能に対応しています。
 
 <div align="center">
 Contex Loop用UI<br>

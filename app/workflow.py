@@ -102,6 +102,20 @@ class GenParams:
     # 音声破損が修正され安全に併用できる。
     easycache_enabled: bool = False
     easycache_threshold: float = 0.2
+    # Turbo (PDD) LoRA: models/loras 内のファイル名（空 = 不使用）。
+    # LoraLoaderModelOnly で強度 1.0 固定。ステップ数は steps に反映済みの
+    # 前提（UI 側で 4〜8 に置き換える）。
+    turbo_lora: str = ""
+    # Block-sparse attention（v0.35 の BlockSparseAttention）。長尺・高解像度
+    # ほど効く。method: sol-attn（学習不要・既定）| sla | vsa（専用重み向け）
+    sparse_enabled: bool = False
+    sparse_method: str = "sol-attn"
+    # r2v: 参照を VAE に通さず TE だけで効かせる（vae/audio_vae を繋がない）
+    ref_te_only: bool = False
+    # ガイド（MiniMaxH3AddGuide）: 任意フレームに画像/音声を固定する。
+    # [{"kind": "image"|"audio", "name": <アップロード済み名>, "frame_idx": int}]
+    # frame_idx は 0 始まりのピクセルフレーム。負値は末尾から数える。
+    guides: list[dict] = field(default_factory=list)
     # i2v: 開始/終端フレーム（アップロード済み画像名。空 = 未指定）
     first_frame: str = ""
     last_frame: str = ""
@@ -116,6 +130,104 @@ class GenParams:
     # ChainDialog.plan() の辞書に、参照/開始フレームをアップロード済み
     # ファイル名へ差し替えたものを入れる。
     chain: dict | None = None
+
+
+SPARSE_METHODS = ("sol-attn", "sla", "vsa")
+
+
+def _apply_model_patches(g: dict, p: GenParams) -> tuple[list, list]:
+    """モデル/CLIP に LoRA・Turbo LoRA・Sigma shift・EasyCache・Sparse
+    attention を順に適用し、(model_src, clip_src) を返す。
+
+    node id: 60〜 ユーザー LoRA、16 Turbo LoRA、6 shift、17 EasyCache、
+    18 sparse attention（20〜は画像/参照ローダ、30〜はガイドが使う）。
+    """
+    model_src: list = ["1", 0]
+    clip_src: list = ["2", 0]
+    # LoRA chain: model と clip を LoraLoader に順に通す。
+    for i, (lora_name, strength) in enumerate(p.loras):
+        if not lora_name:
+            raise ValueError("LoRA のファイル名が空です")
+        nid = str(60 + i)
+        g[nid] = {"class_type": "LoraLoader",
+                  "inputs": {"lora_name": lora_name,
+                             "strength_model": float(strength),
+                             "strength_clip": float(strength),
+                             "model": model_src, "clip": clip_src}}
+        model_src = [nid, 0]
+        clip_src = [nid, 1]
+
+    # Turbo LoRA は model のみ・強度 1.0（公式テンプレートと同じ）。ユーザー
+    # LoRA の後段に置き、蒸留の効きが他 LoRA に上書きされないようにする。
+    if p.turbo_lora:
+        g["16"] = {"class_type": "LoraLoaderModelOnly",
+                   "inputs": {"lora_name": p.turbo_lora,
+                              "strength_model": 1.0,
+                              "model": model_src}}
+        model_src = ["16", 0]
+
+    if p.shift_enabled:
+        g["6"] = {"class_type": "MiniMaxH3SigmaShift",
+                  "inputs": {"model": model_src,
+                             "shift_video": float(p.shift_video),
+                             "shift_audio": float(p.shift_audio)}}
+        model_src = ["6", 0]
+
+    if p.easycache_enabled:
+        g["17"] = {"class_type": "EasyCache",
+                   "inputs": {"model": model_src,
+                              "reuse_threshold": float(p.easycache_threshold),
+                              "start_percent": 0.15, "end_percent": 0.95,
+                              "verbose": False}}
+        model_src = ["17", 0]
+
+    if p.sparse_enabled:
+        method = p.sparse_method or "sol-attn"
+        if method not in SPARSE_METHODS:
+            raise ValueError(f"不明な Sparse Attention 方式です: {method}")
+        # selection は DynamicCombo: 選択キー + "selection.<入力名>" で
+        # 方式ごとのパラメータを渡す（ノード既定値をそのまま使う）。
+        inputs: dict = {"model": model_src, "selection": method,
+                        "start_percent": 0.2, "end_percent": 1.0,
+                        "dense_blocks": "", "min_tokens": 12288,
+                        "extra_tokens": 256,
+                        "sink_conditioning": "exact_kv_and_rows",
+                        "verbose": False}
+        if method == "sol-attn":
+            inputs["selection.tau"] = 1.3
+        else:
+            inputs["selection.keep_percent"] = 10.0
+        g["18"] = {"class_type": "BlockSparseAttention", "inputs": inputs}
+        model_src = ["18", 0]
+    return model_src, clip_src
+
+
+def _apply_guides(g: dict, p: GenParams, cond_src: list,
+                  latent_src: list) -> list:
+    """ガイド（MiniMaxH3AddGuide）を conditioning に数珠つなぎで足し、
+    最終 conditioning の参照を返す。node id 30〜（ガイド）/ 40〜（ローダ）。"""
+    for i, gd in enumerate(p.guides):
+        name = str(gd.get("name") or "").strip()
+        if not name:
+            raise ValueError(f"ガイド {i + 1} のファイルが未指定です")
+        kind = gd.get("kind")
+        load = str(40 + i)
+        node = str(30 + i)
+        inputs: dict = {"positive": cond_src, "latent": latent_src,
+                        "frame_idx": int(gd.get("frame_idx") or 0)}
+        if kind == "image":
+            g[load] = {"class_type": "LoadImage", "inputs": {"image": name}}
+            inputs["image"] = [load, 0]
+            inputs["vae"] = ["3", 0]
+        elif kind == "audio":
+            g[load] = {"class_type": "LoadAudio", "inputs": {"audio": name}}
+            inputs["audio"] = [load, 0]
+            inputs["audio_vae"] = ["4", 0]
+        else:
+            raise ValueError(f"ガイド {i + 1} の種類が不明です: {kind}")
+        g[node] = {"class_type": "MiniMaxH3AddGuide", "inputs": inputs}
+        cond_src = [node, 0]
+    return cond_src
 
 
 def build_graph(p: GenParams) -> dict:
@@ -146,37 +258,7 @@ def build_graph(p: GenParams) -> dict:
                          "device": "default"}}
     g["3"] = {"class_type": "VAELoader", "inputs": {"vae_name": p.vae_video}}
     g["4"] = {"class_type": "VAELoader", "inputs": {"vae_name": p.vae_audio}}
-
-    # LoRA chain: model と clip を LoraLoader に順に通す（node id 60〜。
-    # 20〜は画像/参照ローダが使うため衝突しない）。
-    model_src: list = ["1", 0]
-    clip_src: list = ["2", 0]
-    for i, (lora_name, strength) in enumerate(p.loras):
-        if not lora_name:
-            raise ValueError("LoRA のファイル名が空です")
-        nid = str(60 + i)
-        g[nid] = {"class_type": "LoraLoader",
-                  "inputs": {"lora_name": lora_name,
-                             "strength_model": float(strength),
-                             "strength_clip": float(strength),
-                             "model": model_src, "clip": clip_src}}
-        model_src = [nid, 0]
-        clip_src = [nid, 1]
-
-    if p.shift_enabled:
-        g["6"] = {"class_type": "MiniMaxH3SigmaShift",
-                  "inputs": {"model": model_src,
-                             "shift_video": float(p.shift_video),
-                             "shift_audio": float(p.shift_audio)}}
-        model_src = ["6", 0]
-
-    if p.easycache_enabled:
-        g["17"] = {"class_type": "EasyCache",
-                   "inputs": {"model": model_src,
-                              "reuse_threshold": float(p.easycache_threshold),
-                              "start_percent": 0.15, "end_percent": 0.95,
-                              "verbose": False}}
-        model_src = ["17", 0]
+    model_src, clip_src = _apply_model_patches(g, p)
 
     # ----- conditioning + AV latent ---------------------------------------
     if p.mode in ("t2v", "i2v"):
@@ -209,14 +291,18 @@ def build_graph(p: GenParams) -> dict:
             raise ValueError("参照音声は最大3本です")
         inputs = {
             "clip": clip_src,
-            "vae": ["3", 0],
-            "audio_vae": ["4", 0],
             "prompt": p.prompt,
             "width": int(p.width),
             "height": int(p.height),
             "length": int(p.frames),
             "ref_image_size": p.ref_image_size,
         }
+        # v0.35 で vae/audio_vae が任意入力になった。繋がないと参照は
+        # テキストエンコーダにだけ渡り（TE のみ参照）、VAE 参照トークンが
+        # 乗らない分だけ速いが同一性の再現は弱くなる。
+        if not p.ref_te_only:
+            inputs["vae"] = ["3", 0]
+            inputs["audio_vae"] = ["4", 0]
         # Autogrow 入力の API 形式は「<親ID>.<プレフィックス><0始まり連番>」
         # （例: ref_images.ref_image_0）。プロンプト内の <Picture i> タグは
         # 1始まりだが、入力キーは 0 始まりである点に注意。
@@ -243,6 +329,9 @@ def build_graph(p: GenParams) -> dict:
             nid += 1
         g["5"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": inputs}
 
+    # ----- ガイド（任意フレームへの画像/音声固定）-------------------------
+    cond_src = _apply_guides(g, p, ["5", 0], ["5", 1])
+
     # ----- sampling (CFG 無し: BasicGuider) --------------------------------
     g["7"] = {"class_type": "RandomNoise", "inputs": {"noise_seed": p.seed}}
     g["8"] = {"class_type": "KSamplerSelect",
@@ -251,7 +340,7 @@ def build_graph(p: GenParams) -> dict:
               "inputs": {"model": model_src, "scheduler": p.scheduler,
                          "steps": int(p.steps), "denoise": 1.0}}
     g["10"] = {"class_type": "BasicGuider",
-               "inputs": {"model": model_src, "conditioning": ["5", 0]}}
+               "inputs": {"model": model_src, "conditioning": cond_src}}
     g["11"] = {"class_type": "SamplerCustomAdvanced",
                "inputs": {"noise": ["7", 0], "guider": ["10", 0],
                           "sampler": ["8", 0], "sigmas": ["9", 0],
@@ -291,8 +380,12 @@ CHAIN_CROP = "disabled"
 CHAIN_MAX_SHOTS = 128
 
 
-def chain_plan_json(chain: dict) -> str:
-    """ChainDialog の設定を Plan ノードの plan_json 文字列にする。"""
+def chain_plan_json(chain: dict, force_steps: int | None = None) -> str:
+    """ChainDialog の設定を Plan ノードの plan_json 文字列にする。
+
+    ``force_steps`` を与えるとシーン個別の steps 指定を捨てて全シーン同じ
+    値にする（Turbo LoRA 用）。
+    """
     shots = []
     for s in chain.get("shots", []):
         shot: dict = {
@@ -300,7 +393,9 @@ def chain_plan_json(chain: dict) -> str:
             "prompt": str(s.get("prompt") or ""),
             "duration_seconds": float(s.get("duration_seconds") or 5.0),
         }
-        if int(s.get("steps") or 0) > 0:
+        if force_steps:
+            shot["steps"] = int(force_steps)
+        elif int(s.get("steps") or 0) > 0:
             shot["steps"] = int(s["steps"])
         seed = str(s.get("seed") or "").strip()
         if seed:
@@ -370,37 +465,17 @@ def build_chain_graph(p: GenParams) -> dict:
                          "device": "default"}}
     g["3"] = {"class_type": "VAELoader", "inputs": {"vae_name": p.vae_video}}
     g["4"] = {"class_type": "VAELoader", "inputs": {"vae_name": p.vae_audio}}
+    model_src, clip_src = _apply_model_patches(g, p)
 
-    model_src: list = ["1", 0]
-    clip_src: list = ["2", 0]
-    for i, (lora_name, strength) in enumerate(p.loras):
-        if not lora_name:
-            raise ValueError("LoRA のファイル名が空です")
-        nid = str(60 + i)
-        g[nid] = {"class_type": "LoraLoader",
-                  "inputs": {"lora_name": lora_name,
-                             "strength_model": float(strength),
-                             "strength_clip": float(strength),
-                             "model": model_src, "clip": clip_src}}
-        model_src = [nid, 0]
-        clip_src = [nid, 1]
-    if p.shift_enabled:
-        g["6"] = {"class_type": "MiniMaxH3SigmaShift",
-                  "inputs": {"model": model_src,
-                             "shift_video": float(p.shift_video),
-                             "shift_audio": float(p.shift_audio)}}
-        model_src = ["6", 0]
-    if p.easycache_enabled:
-        g["17"] = {"class_type": "EasyCache",
-                   "inputs": {"model": model_src,
-                              "reuse_threshold": float(p.easycache_threshold),
-                              "start_percent": 0.15, "end_percent": 0.95,
-                              "verbose": False}}
-        model_src = ["17", 0]
+    # Turbo LoRA 使用時はシーン個別の steps 指定も含めて p.steps
+    # （UI 側で Turbo 用ステップ数に置換済み）へ揃える。
+    force_steps = int(p.steps) if p.turbo_lora else None
+    default_steps = (force_steps if force_steps
+                     else int(chain.get("default_steps") or p.steps))
 
     # ----- チェーン制御 ----------------------------------------------------
     g["100"] = {"class_type": "MiniMaxH3ChainPlan", "inputs": {
-        "plan_json": chain_plan_json(chain),
+        "plan_json": chain_plan_json(chain, force_steps=force_steps),
         "run_name": str(chain.get("run_name") or "h3_chain"),
         "generation_fingerprint": "",
         "width": int(p.width),
@@ -412,7 +487,7 @@ def build_chain_graph(p: GenParams) -> dict:
         "audio_mode": str(chain.get("audio_mode") or "generated_audio"),
         "audio_context_length": int(chain.get("audio_context_length") or 22),
         "default_duration_seconds": 15.0,
-        "default_steps": int(chain.get("default_steps") or p.steps),
+        "default_steps": default_steps,
         "base_seed": int(str(chain.get("base_seed") or "0") or 0),
         "segment_crf": int(chain.get("segment_crf") or 18),
     }}

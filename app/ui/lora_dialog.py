@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 
 from .window_state import bind_geometry
 from .. import config, lora
+from ..bootstrap import models as models_mod
 
 _ICON_SIZE = 144
 _GRID_SIZE = QSize(168, 196)
@@ -326,7 +327,10 @@ class LoraDialog(QDialog):
     def rescan(self) -> None:
         """(Re)list models/loras and restart the metadata worker."""
         self._stop_worker()
-        names = config.scan_models("loras")
+        # 公式 Turbo LoRA は高速化設定側で扱うため一覧から除く（二重適用防止）。
+        turbo = set(models_mod.TURBO_LORAS.values())
+        names = [n for n in config.scan_models("loras")
+                 if Path(n).name not in turbo]
         self.lst.clear()
         self._items.clear()
         # 既知メタは残す（ワーカーがキャッシュから同じ内容を再供給する）

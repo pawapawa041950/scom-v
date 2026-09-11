@@ -28,13 +28,15 @@ from .widgets import (
     FlowLayout, GrowingTextEdit, PlaceholderListWidget, WideComboBox,
 )
 from ..bootstrap import environment
+from ..bootstrap import models as models_mod
 from ..bootstrap.setup import (
     SetupError, install_sage_attention, sage_installed, _Manifest,
 )
 from ..comfy_backend import ComfyBackend, BackendError, Progress
 from ..workflow import (
     GenParams, build_graph, frames_for_seconds, size_for_aspect,
-    size_for_image, ASPECT_PRESETS, SAMPLERS, SCHEDULERS,
+    size_for_image, ASPECT_PRESETS, SAMPLERS, SCHEDULERS, FPS,
+    SPARSE_METHODS,
 )
 
 MAX_SEED = 2**63 - 1
@@ -80,6 +82,32 @@ class _SageInstallWorker(QObject):
             self.failed.emit(str(e))
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))
+
+
+class _ModelDownloadWorker(QObject):
+    """1ファイルをバックグラウンドでダウンロードする（Turbo LoRA 用）。"""
+    progress = Signal(float, float)   # done, total bytes
+    done = Signal(str)                # filename
+    failed = Signal(str, str)         # filename, message
+
+    def __init__(self, paths: config.AppPaths, item: models_mod.ModelFile):
+        super().__init__()
+        self.paths = paths
+        self.item = item
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        try:
+            models_mod.download_model(
+                self.paths, self.item,
+                on_progress=lambda d, t: self.progress.emit(float(d), float(t)),
+                cancel=lambda: self._cancel)
+            self.done.emit(self.item.filename)
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(self.item.filename, str(e))
 
 
 class _StartWorker(QObject):
@@ -138,6 +166,8 @@ class _GenWorker(QObject):
 
 
 class MainWindow(QMainWindow):
+    _NOT_READY_TIP = "バックエンド（ComfyUI）の準備が完了するまで生成できません"
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("scom-v - 動画生成")
@@ -160,6 +190,11 @@ class MainWindow(QMainWindow):
         # ContexLoop の設定（専用ウィンドウが保持する plan 辞書）。
         self._chain_plan: Optional[dict] = None
         self._chain_dlg = None
+        # Turbo LoRA のダウンロードジョブ（同時に1つ）。
+        self._turbo_job: Optional[tuple] = None
+        self._turbo_last_pct = -1
+        # fl2v 用 Turbo LoRA の版（r2v 表示中もこの値を保持し、保存する）。
+        self._turbo_fl2v_variant = "8step"
         # 適用中 LoRA（チェックポイント別に記憶: fl2va = t2v/i2v, ref2va = r2v。
         # scom と同様、アプリ再起動では保存しない）。
         self._loras_by_family: dict[str, list[dict]] = {
@@ -304,8 +339,9 @@ class MainWindow(QMainWindow):
         lv.addWidget(self.stack_mode)
         lv.addStretch(1)
 
-        # 中央ペイン: 設定を最上部に置く（Prompt はその下）
+        # 中央ペイン: 設定を最上部に置く（その下にガイド、Prompt）
         cv.insertWidget(0, self._build_settings_box())
+        cv.insertWidget(1, self._build_guides_box())
 
         # 右カラム: ログ / プレビュー / アクション
         right = QWidget()
@@ -339,6 +375,9 @@ class MainWindow(QMainWindow):
         self.btn_continuous.toggled.connect(self._update_cancel_button)
         self.btn_generate = QPushButton("生成")
         self.btn_generate.clicked.connect(self.on_generate)
+        # バックエンド（ComfyUI）の準備が終わるまで押せない。
+        self.btn_generate.setEnabled(False)
+        self.btn_generate.setToolTip(self._NOT_READY_TIP)
         self.btn_cancel = QPushButton("キャンセル")
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(self.on_cancel)
@@ -572,6 +611,15 @@ class MainWindow(QMainWindow):
         size_row.addWidget(lbl_rs)
         size_row.addWidget(self.cb_ref_size, stretch=1)
         grid.addLayout(size_row, 3, 0, 1, 2)
+        # TE のみ参照（v0.35〜: vae/audio_vae を繋がない）
+        self.chk_ref_te_only = QCheckBox(
+            "TE のみ参照（VAE を通さない・同一性より内容重視）")
+        self.chk_ref_te_only.setToolTip(
+            "参照素材をテキストエンコーダ（Qwen3-VL）にだけ渡し、VAE の\n"
+            "参照トークンを乗せません。人物などの見た目の一致は弱くなり、\n"
+            "内容や雰囲気の理解だけを参照に使う形になります。\n"
+            "速度差は小さく、参照解像度 max や参照動画が多いときだけ効きます")
+        grid.addWidget(self.chk_ref_te_only, 4, 0, 1, 2)
         return page
 
     def _build_settings_box(self) -> QGroupBox:
@@ -738,7 +786,294 @@ class MainWindow(QMainWindow):
         ec.addWidget(self.sp_easycache)
         ec.addStretch(1)
         v.addLayout(ec)
+
+        # Turbo (PDD) LoRA — 少ステップ蒸留。ON の間は Steps 欄の代わりに
+        # ここのステップ数を使う。1行構成。
+        tr = QHBoxLayout()
+        self.chk_turbo = QCheckBox("Turbo LoRA")
+        self.chk_turbo.setToolTip(
+            "公式の蒸留 LoRA（各 1.96GB）で 4〜8 ステップ生成にします。\n"
+            "ON の間は設定の Steps ではなくこの行のステップ数を使います。\n"
+            "t2v/i2v は fl2v 用（8step 版を 4 ステップで使うのが公式既定）、"
+            "r2v は ref2v 用 4step 版が自動で選ばれます。\n"
+            "未ダウンロードなら ON にしたときに確認を出します。")
+        tr.addWidget(self.chk_turbo)
+        # 版の選択肢はモード（fl2v / ref2v）に応じて _refill_turbo_variants
+        # が入れ替える。ref2v は 1 種類だが、何が使われるか分かるよう表示する。
+        self.cb_turbo_variant = WideComboBox()
+        self.cb_turbo_variant.setToolTip(
+            "使う Turbo LoRA の版。\n"
+            "t2v/i2v: fl2v 8step（汎用・4〜8 ステップ）/ fl2v 4step 768p"
+            "（768p 向け 4 ステップ特化）\n"
+            "r2v: ref2v 4step（現在この 1 種類のみ）")
+        self.cb_turbo_variant.setEnabled(False)
+        self._refill_turbo_variants()
+        tr.addWidget(self.cb_turbo_variant)
+        tr.addWidget(QLabel("Steps"))
+        self.sp_turbo_steps = QSpinBox()
+        self.sp_turbo_steps.setRange(1, 12)
+        self.sp_turbo_steps.setValue(4)
+        self.sp_turbo_steps.setEnabled(False)
+        self.sp_turbo_steps.setToolTip("Turbo LoRA 使用時のステップ数（公式既定 4）")
+        tr.addWidget(self.sp_turbo_steps)
+        tr.addStretch(1)
+        v.addLayout(tr)
+        self.chk_turbo.toggled.connect(self._on_turbo_toggled)
+        self.cb_turbo_variant.currentIndexChanged.connect(
+            self._on_turbo_variant_changed)
+
+        # Block-sparse attention（v0.35〜）— 1行構成
+        sa = QHBoxLayout()
+        self.chk_sparse = QCheckBox("Sparse Attention")
+        self.chk_sparse.setToolTip(
+            "attention をブロック単位で間引いて高速化します（実験的機能）。\n"
+            "長尺・高解像度ほど効果が大きく、短い動画では速くなりません。\n"
+            "sol-attn: 学習不要（既定）。sla / vsa: 専用に学習された重み向け")
+        sa.addWidget(self.chk_sparse)
+        sa.addWidget(QLabel("方式"))
+        self.cb_sparse_method = WideComboBox()
+        for m in SPARSE_METHODS:
+            self.cb_sparse_method.addItem(m, m)
+        self.cb_sparse_method.setEnabled(False)
+        self.chk_sparse.toggled.connect(self.cb_sparse_method.setEnabled)
+        sa.addWidget(self.cb_sparse_method)
+        sa.addStretch(1)
+        v.addLayout(sa)
         return box
+
+    # ----- Turbo LoRA ------------------------------------------------------
+    def _turbo_ckpt_kind(self) -> str:
+        """現在のモードで使うチェックポイント系統（fl2va / ref2va）。"""
+        mode = self._mode()
+        if mode == "r2v":
+            return "ref2va"
+        if mode == "chain":
+            plan = self._current_chain_plan() or self._chain_plan or {}
+            if plan.get("chain_type") == "r2v":
+                return "ref2va"
+        return "fl2va"
+
+    def _turbo_lora_name(self) -> str:
+        """現在のモード/版に対応する Turbo LoRA のファイル名。"""
+        kind = self._turbo_ckpt_kind()
+        variant = (self._turbo_fl2v_variant if kind == "fl2va" else "4step")
+        return models_mod.turbo_lora_for(kind, variant)
+
+    _TURBO_VARIANTS = {
+        "fl2va": [("fl2v 8step", "8step"), ("fl2v 4step 768p", "4step_768p")],
+        "ref2va": [("ref2v 4step", "4step")],
+    }
+
+    def _refill_turbo_variants(self) -> None:
+        """モードに応じた版の選択肢に入れ替える（fl2v の選択は記憶）。"""
+        kind = self._turbo_ckpt_kind()
+        items = self._TURBO_VARIANTS[kind]
+        cb = self.cb_turbo_variant
+        cb.blockSignals(True)
+        cb.clear()
+        for label, data in items:
+            cb.addItem(label, data)
+        if kind == "fl2va":
+            i = cb.findData(self._turbo_fl2v_variant)
+            cb.setCurrentIndex(i if i >= 0 else 0)
+        cb.blockSignals(False)
+
+    def _turbo_lora_present(self, name: str) -> bool:
+        p = self.paths.models / "loras" / name
+        if not p.is_file():
+            return False
+        m = next((m for m in models_mod.load_manifest(self.paths)
+                  if m.filename == name), None)
+        return not (m and m.size) or p.stat().st_size == m.size
+
+    def _sync_turbo_controls(self) -> None:
+        on = self.chk_turbo.isChecked()
+        self.sp_steps.setEnabled(not on)
+        self.sp_steps.setToolTip(
+            "Turbo LoRA が ON のため、高速化設定のステップ数が使われます"
+            if on else "")
+        self.sp_turbo_steps.setEnabled(on)
+        self._refill_turbo_variants()
+        self.cb_turbo_variant.setEnabled(on)
+
+    def _on_turbo_toggled(self, checked: bool) -> None:
+        self._sync_turbo_controls()
+        if self._loading:
+            return
+        self._schedule_save()
+        if checked:
+            self._ensure_turbo_lora()
+
+    def _on_turbo_variant_changed(self, *_a) -> None:
+        if self._turbo_ckpt_kind() == "fl2va":
+            self._turbo_fl2v_variant = (
+                self.cb_turbo_variant.currentData() or "8step")
+        if self._loading:
+            return
+        self._schedule_save()
+        if self.chk_turbo.isChecked():
+            self._ensure_turbo_lora()
+
+    def _ensure_turbo_lora(self) -> bool:
+        """必要な Turbo LoRA が無ければダウンロードを確認して開始する。
+        既にある（または開始済み）なら True。"""
+        name = self._turbo_lora_name()
+        if self._turbo_lora_present(name):
+            return True
+        if self._turbo_job is not None:
+            return False
+        m = next((m for m in models_mod.load_manifest(self.paths)
+                  if m.filename == name), None)
+        if m is None:
+            QMessageBox.warning(
+                self, "Turbo LoRA",
+                f"models.json に {name} の定義がありません。")
+            return False
+        from .model_selector import fmt_size
+        ret = QMessageBox.question(
+            self, "Turbo LoRA",
+            f"Turbo LoRA が未ダウンロードです。\n{name}"
+            f"（{fmt_size(m.size)}）\nダウンロードしますか？",
+            QMessageBox.Yes | QMessageBox.Cancel)
+        if ret != QMessageBox.Yes:
+            return False
+        self._start_turbo_download(m)
+        return False
+
+    def _start_turbo_download(self, m: models_mod.ModelFile) -> None:
+        self.append_log(f"Turbo LoRA をダウンロードしています: {m.filename}")
+        thread = QThread()
+        worker = _ModelDownloadWorker(self.paths, m)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_turbo_progress)
+        worker.done.connect(self._on_turbo_downloaded)
+        worker.failed.connect(self._on_turbo_download_failed)
+        worker.done.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        self._turbo_job = (thread, worker)
+        self._turbo_last_pct = -1
+        thread.finished.connect(self._on_turbo_thread_finished)
+        thread.start()
+
+    def _on_turbo_thread_finished(self) -> None:
+        self._turbo_job = None
+
+    def _on_turbo_progress(self, done: float, total: float) -> None:
+        if total <= 0:
+            return
+        pct = int(done * 100 / total)
+        if pct // 10 != self._turbo_last_pct // 10:
+            self._turbo_last_pct = pct
+            self.append_log(f"Turbo LoRA ダウンロード {pct}%")
+
+    def _on_turbo_downloaded(self, name: str) -> None:
+        self.append_log(f"Turbo LoRA のダウンロードが完了しました: {name}")
+
+    def _on_turbo_download_failed(self, name: str, msg: str) -> None:
+        self.append_log(f"Turbo LoRA のダウンロードに失敗: {name}: {msg}")
+        QMessageBox.warning(
+            self, "Turbo LoRA", f"ダウンロードに失敗しました:\n{msg}")
+
+    # ----- ガイド（AddGuide）------------------------------------------------
+    _MAX_GUIDES = 8
+
+    def _build_guides_box(self) -> QGroupBox:
+        """画像/音声を任意フレームに固定するガイド行の一覧。"""
+        box = self.box_guides = QGroupBox("ガイド（フレーム固定）")
+        box.setToolTip(
+            "画像や音声を動画の指定フレームに固定します（MiniMaxH3AddGuide）。\n"
+            "秒: 0 = 先頭、負の値は末尾から数えます（-0.1 ≒ 最後の数フレーム）。\n"
+            "画像は 32 の倍数の出力解像度へ中央クロップで合わせられます。\n"
+            "長尺チェーンでは使われません")
+        v = QVBoxLayout(box)
+        head = QHBoxLayout()
+        self.lbl_guides = QLabel("")
+        self.lbl_guides.setStyleSheet("color:#888;")
+        head.addWidget(self.lbl_guides, stretch=1)
+        btn_img = QPushButton("+ 画像")
+        btn_img.setToolTip("指定フレームに固定する画像を追加")
+        btn_img.clicked.connect(lambda: self._add_guide("image"))
+        btn_aud = QPushButton("+ 音声")
+        btn_aud.setToolTip("指定フレームから流す音声を追加")
+        btn_aud.clicked.connect(lambda: self._add_guide("audio"))
+        head.addWidget(btn_img)
+        head.addWidget(btn_aud)
+        v.addLayout(head)
+        self._guides_layout = QVBoxLayout()
+        self._guides_layout.setContentsMargins(0, 0, 0, 0)
+        v.addLayout(self._guides_layout)
+        self._guides: list[dict] = []
+        self._update_guides_label()
+        return box
+
+    def _update_guides_label(self) -> None:
+        n = len(self._guides)
+        self.lbl_guides.setText(
+            f"{n}/{self._MAX_GUIDES} 件" if n else
+            "画像/音声を指定フレームに固定できます（任意）")
+
+    def _add_guide(self, kind: str) -> None:
+        if len(self._guides) >= self._MAX_GUIDES:
+            QMessageBox.information(
+                self, "上限", f"ガイドは最大 {self._MAX_GUIDES} 件です。")
+            return
+        flt = _IMAGE_FILTER if kind == "image" else _AUDIO_FILTER
+        path, _ = QFileDialog.getOpenFileName(
+            self, "ガイドに使う" + ("画像" if kind == "image" else "音声"),
+            "", flt)
+        if not path:
+            return
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        lbl_kind = QLabel("画像" if kind == "image" else "音声")
+        lbl_kind.setStyleSheet("color:#888;")
+        lbl_name = QLabel(Path(path).name)
+        lbl_name.setToolTip(path)
+        sp_sec = QDoubleSpinBox()
+        sp_sec.setRange(-60.0, 60.0)
+        sp_sec.setSingleStep(0.5)
+        sp_sec.setDecimals(2)
+        sp_sec.setValue(0.0)
+        sp_sec.setSuffix(" 秒")
+        sp_sec.setToolTip(
+            "固定するフレームの時刻。24fps でフレーム番号へ丸めます。\n"
+            "負の値は末尾から数えます")
+        btn_del = QPushButton("🗑")
+        btn_del.setFixedWidth(28)
+        btn_del.setToolTip("このガイドを削除")
+        h.addWidget(lbl_kind)
+        h.addWidget(lbl_name, stretch=1)
+        h.addWidget(sp_sec)
+        h.addWidget(btn_del)
+        entry = {"kind": kind, "path": path, "row": row, "spin": sp_sec}
+        btn_del.clicked.connect(lambda: self._remove_guide(entry))
+        self._guides.append(entry)
+        self._guides_layout.addWidget(row)
+        self._update_guides_label()
+
+    def _remove_guide(self, entry: dict) -> None:
+        if entry not in self._guides:
+            return
+        self._guides.remove(entry)
+        row = entry["row"]
+        self._guides_layout.removeWidget(row)
+        row.deleteLater()
+        self._update_guides_label()
+
+    def _guide_params(self) -> list[dict]:
+        """ガイド行を GenParams.guides 形式へ（ファイルはアップロード）。"""
+        out = []
+        for e in self._guides:
+            sec = float(e["spin"].value())
+            frame_idx = int(round(sec * FPS))
+            if sec < 0 and frame_idx == 0:
+                frame_idx = -1
+            out.append({"kind": e["kind"],
+                        "name": self._upload(e["path"]),
+                        "frame_idx": frame_idx})
+        return out
 
     def _init_sage_checkbox(self) -> None:
         """環境の対応可否を判定して初期状態を決める（対応外なら無効化）。"""
@@ -834,7 +1169,15 @@ class MainWindow(QMainWindow):
         # チェーンではシーンごとのプロンプトを専用ウィンドウで編集するので、
         # メイン側のプロンプト欄は隠す。
         self.box_prompt.setVisible(mode != "chain")
+        # ガイドはチェーン（シーン単位の条件付け）では使わない。
+        if hasattr(self, "box_guides"):
+            self.box_guides.setVisible(mode != "chain")
         self._update_chain_summary()
+        # Turbo LoRA はチェックポイント系統（fl2v/ref2v）で別ファイル。
+        if hasattr(self, "chk_turbo"):
+            self._sync_turbo_controls()
+            if not self._loading and self.chk_turbo.isChecked():
+                self._ensure_turbo_lora()
         self.lbl_diffusion.setText(
             "Diffusion (ref2va):" if mode == "r2v" else "Diffusion (fl2va):")
         # アスペクト比の有効/無効（i2v・手動で無効）とサイズ再計算。
@@ -1434,6 +1777,17 @@ class MainWindow(QMainWindow):
         self.sp_easycache.setValue(float(s.get("easycache_threshold", 0.2)))
         if self.chk_sage.isEnabled():
             self.chk_sage.setChecked(bool(s.get("sage_attention", False)))
+        tv = str(s.get("turbo_variant", "8step"))
+        if tv in dict(self._TURBO_VARIANTS["fl2va"]).values():
+            self._turbo_fl2v_variant = tv
+        self.sp_turbo_steps.setValue(int(s.get("turbo_steps", 4)))
+        self.chk_turbo.setChecked(bool(s.get("turbo_enabled", False)))
+        self._sync_turbo_controls()
+        si = self.cb_sparse_method.findData(str(s.get("sparse_method", "sol-attn")))
+        if si >= 0:
+            self.cb_sparse_method.setCurrentIndex(si)
+        self.chk_sparse.setChecked(bool(s.get("sparse_enabled", False)))
+        self.chk_ref_te_only.setChecked(bool(s.get("ref_te_only", False)))
         self.chk_same_frame.setChecked(
             bool(s.get("same_first_last_frame", False)))
         ri = self.cb_ref_size.findData(str(s.get("ref_image_size", "match")))
@@ -1474,6 +1828,10 @@ class MainWindow(QMainWindow):
         self.sp_easycache.valueChanged.connect(self._schedule_save)
         self.ed_seed.textChanged.connect(self._schedule_save)
         self.cb_ref_size.currentIndexChanged.connect(self._schedule_save)
+        self.chk_ref_te_only.toggled.connect(self._schedule_save)
+        self.sp_turbo_steps.valueChanged.connect(self._schedule_save)
+        self.chk_sparse.toggled.connect(self._schedule_save)
+        self.cb_sparse_method.currentIndexChanged.connect(self._schedule_save)
         self.splitter.splitterMoved.connect(self._schedule_save)
 
     def _schedule_save(self, *args) -> None:
@@ -1518,6 +1876,12 @@ class MainWindow(QMainWindow):
             "easycache_threshold": float(self.sp_easycache.value()),
             "same_first_last_frame": self.chk_same_frame.isChecked(),
             "ref_image_size": self.cb_ref_size.currentData() or "match",
+            "ref_te_only": self.chk_ref_te_only.isChecked(),
+            "turbo_enabled": self.chk_turbo.isChecked(),
+            "turbo_steps": int(self.sp_turbo_steps.value()),
+            "turbo_variant": self._turbo_fl2v_variant,
+            "sparse_enabled": self.chk_sparse.isChecked(),
+            "sparse_method": self.cb_sparse_method.currentData() or "sol-attn",
         }
         # ジオメトリはウィンドウ表示後のみ保存する。未表示（起動処理中）の
         # splitter.sizes() はレイアウト未確定の仮値で、保存すると復元済みの
@@ -1551,10 +1915,15 @@ class MainWindow(QMainWindow):
     def _on_backend_ready(self) -> None:
         self.status.showMessage(f"バックエンド準備完了: {self.backend.base_url}")
         self.append_log("バックエンド準備完了")
+        # 準備完了で初めて生成ボタンを有効にする。
+        self.btn_generate.setEnabled(True)
+        self._update_generate_button()
 
     def _on_backend_failed(self, msg: str) -> None:
         self.status.showMessage("バックエンドの起動に失敗")
         self.append_log("エラー: " + msg)
+        self.btn_generate.setEnabled(False)
+        self.btn_generate.setToolTip("バックエンドの起動に失敗したため生成できません")
         QMessageBox.critical(self, "バックエンドエラー", msg)
 
     # ----- generation ------------------------------------------------------
@@ -1636,6 +2005,21 @@ class MainWindow(QMainWindow):
                 it = self.lst_ref_audios.item(i)
                 ref_audios.append(self._upload(it.data(Qt.UserRole)))
 
+        # Turbo LoRA: モード（チェーンは plan の種類）に応じたファイル。
+        # 未ダウンロードならここで止める（ダウンロード中も含む）。
+        turbo_lora = ""
+        steps = self.sp_steps.value()
+        if self.chk_turbo.isChecked():
+            turbo_lora = self._turbo_lora_name()
+            if not self._turbo_lora_present(turbo_lora):
+                raise ValueError(
+                    f"Turbo LoRA がまだダウンロードされていません:\n{turbo_lora}\n"
+                    "高速化設定の Turbo LoRA を入れ直してダウンロードするか、"
+                    "Models の「設定…」から Turbo LoRA セットを取得してください")
+            steps = int(self.sp_turbo_steps.value())
+
+        guides = self._guide_params() if mode != "chain" else []
+
         return GenParams(
             mode=mode,
             diffusion=self.cb_diffusion.currentText().strip(),
@@ -1646,7 +2030,7 @@ class MainWindow(QMainWindow):
             width=width,
             height=height,
             frames=frames_for_seconds(self.sp_length.value()),
-            steps=self.sp_steps.value(),
+            steps=steps,
             sampler=self.cb_sampler.currentText(),
             scheduler=self.cb_scheduler.currentText(),
             seed=seed,
@@ -1665,6 +2049,11 @@ class MainWindow(QMainWindow):
             ref_images=ref_images,
             ref_videos=ref_videos,
             ref_audios=ref_audios,
+            ref_te_only=self.chk_ref_te_only.isChecked(),
+            turbo_lora=turbo_lora,
+            sparse_enabled=self.chk_sparse.isChecked(),
+            sparse_method=self.cb_sparse_method.currentData() or "sol-attn",
+            guides=guides,
         )
 
     def on_generate(self) -> None:
@@ -1749,7 +2138,8 @@ class MainWindow(QMainWindow):
                 "積みます。現在の生成が終わると順番に実行されます")
         else:
             self.btn_generate.setText("生成")
-            self.btn_generate.setToolTip("")
+            self.btn_generate.setToolTip(
+                "" if self.backend.is_running() else self._NOT_READY_TIP)
 
     def _skip_mode(self) -> bool:
         """「スキップ」として振る舞うか（連続 ON、または待機タスクあり）。"""
@@ -1821,7 +2211,7 @@ class MainWindow(QMainWindow):
     def _cleanup_gen_thread(self) -> None:
         self._gen_thread = None
         self._gen_worker = None
-        self.btn_generate.setEnabled(True)
+        self.btn_generate.setEnabled(self.backend.is_running())
         self.btn_cancel.setEnabled(False)
         skip = self._gen_skip
         self._gen_skip = False
