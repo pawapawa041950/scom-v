@@ -249,6 +249,10 @@ def build_graph(p: GenParams) -> dict:
         raise ValueError("動画 VAE を選択してください")
     if not p.vae_audio:
         raise ValueError("音声 VAE を選択してください")
+    if p.vae_audio == p.vae_video:
+        raise ValueError(
+            "動画 VAE と音声 VAE に同じファイルが選ばれています。\n"
+            "音声 VAE には minimax_h3_audio_vae_fp32.safetensors を選んでください")
     if p.mode == "chain":
         return build_chain_graph(p)
     if p.mode not in ("t2v", "i2v", "r2v"):

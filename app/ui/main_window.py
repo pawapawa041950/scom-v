@@ -1828,6 +1828,13 @@ class MainWindow(QMainWindow):
             self.cb_vae_video.setCurrentText(str(s.get("vae_video")))
         if str(s.get("vae_audio", "")):
             self.cb_vae_audio.setCurrentText(str(s.get("vae_audio")))
+        # 保存値が食い違っていたら（音声 VAE に動画 VAE が入っている等）
+        # 名前で選び直す。同じファイルを両方に使うと音声デコードで落ちる。
+        if (self.cb_vae_audio.currentText() == self.cb_vae_video.currentText()
+                or "audio" not in self.cb_vae_audio.currentText().lower()):
+            self._auto_pick(self.cb_vae_audio, "audio")
+        if "audio" in self.cb_vae_video.currentText().lower():
+            self._auto_pick(self.cb_vae_video, "video")
         ai = self.cb_aspect.findText(str(s.get("aspect", "16:9")))
         if ai >= 0:
             self.cb_aspect.setCurrentIndex(ai)
