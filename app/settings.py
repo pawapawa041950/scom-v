@@ -44,9 +44,10 @@ DEFAULTS: dict[str, Any] = {
     # EasyCache 高速化（ステップスキップ。閾値が大きいほど速いが品質低下）
     "easycache_enabled": False,
     "easycache_threshold": 0.2,
-    # Turbo (PDD) LoRA: 少ステップ蒸留。ON の間は steps を turbo_steps で上書き
+    # Turbo (PDD) LoRA: 少ステップ蒸留。ON の間は steps を版ごとのステップ数で
+    # 上書きする。turbo_steps_map は "版:ステップ" のカンマ区切り。
     "turbo_enabled": False,
-    "turbo_steps": 4,
+    "turbo_steps_map": "8step:8,4step_768p:4,4step:4",
     "turbo_variant": "8step",      # fl2v 用: 8step | 4step_768p（r2v は 4step 固定）
     # Sparse Attention（H3 専用 block-sparse。長尺・高解像度向け、品質と交換）
     "sparse_enabled": False,

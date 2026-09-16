@@ -195,6 +195,8 @@ class MainWindow(QMainWindow):
         self._turbo_last_pct = -1
         # fl2v 用 Turbo LoRA の版（r2v 表示中もこの値を保持し、保存する）。
         self._turbo_fl2v_variant = "8step"
+        # 版ごとのステップ数（設定から復元、スピンボックス変更で更新）。
+        self._turbo_steps: dict[str, int] = dict(models_mod.TURBO_DEFAULT_STEPS)
         # 適用中 LoRA（チェックポイント別に記憶: fl2va = t2v/i2v, ref2va = r2v。
         # scom と同様、アプリ再起動では保存しない）。
         self._loras_by_family: dict[str, list[dict]] = {
@@ -794,8 +796,10 @@ class MainWindow(QMainWindow):
         self.chk_turbo.setToolTip(
             "公式の蒸留 LoRA（各 1.96GB）で 4〜8 ステップ生成にします。\n"
             "ON の間は設定の Steps ではなくこの行のステップ数を使います。\n"
-            "t2v/i2v は fl2v 用（8step 版を 4 ステップで使うのが公式既定）、"
+            "t2v/i2v は fl2v 用（8step: 544p 学習・推奨 8 ステップ / "
+            "4step 768p: 768p 学習・shift 6/3 を自動適用）、\n"
             "r2v は ref2v 用 4step 版が自動で選ばれます。\n"
+            "EasyCache との併用は品質が崩れやすいので避けてください。\n"
             "未ダウンロードなら ON にしたときに確認を出します。")
         tr.addWidget(self.chk_turbo)
         # 版の選択肢はモード（fl2v / ref2v）に応じて _refill_turbo_variants
@@ -807,17 +811,22 @@ class MainWindow(QMainWindow):
             "（768p 向け 4 ステップ特化）\n"
             "r2v: ref2v 4step（現在この 1 種類のみ）")
         self.cb_turbo_variant.setEnabled(False)
-        self._refill_turbo_variants()
         tr.addWidget(self.cb_turbo_variant)
         tr.addWidget(QLabel("Steps"))
         self.sp_turbo_steps = QSpinBox()
         self.sp_turbo_steps.setRange(1, 12)
         self.sp_turbo_steps.setValue(4)
         self.sp_turbo_steps.setEnabled(False)
-        self.sp_turbo_steps.setToolTip("Turbo LoRA 使用時のステップ数（公式既定 4）")
+        self.sp_turbo_steps.setToolTip(
+            "Turbo LoRA 使用時のステップ数（版ごとに記憶）。\n"
+            "既定: fl2v 8step = 8（公式テンプレは 6）、fl2v 4step 768p = 4、"
+            "ref2v 4step = 4")
+        self.sp_turbo_steps.valueChanged.connect(self._on_turbo_steps_changed)
         tr.addWidget(self.sp_turbo_steps)
         tr.addStretch(1)
         v.addLayout(tr)
+        # 版の選択肢とステップ数はコンボ/スピン両方が出来てから入れる。
+        self._refill_turbo_variants()
         self.chk_turbo.toggled.connect(self._on_turbo_toggled)
         self.cb_turbo_variant.currentIndexChanged.connect(
             self._on_turbo_variant_changed)
@@ -877,6 +886,28 @@ class MainWindow(QMainWindow):
             i = cb.findData(self._turbo_fl2v_variant)
             cb.setCurrentIndex(i if i >= 0 else 0)
         cb.blockSignals(False)
+        self._load_turbo_steps()
+
+    def _current_turbo_variant(self) -> str:
+        """現在表示中の版キー（8step / 4step_768p / 4step）。"""
+        return str(self.cb_turbo_variant.currentData() or "8step")
+
+    def _load_turbo_steps(self) -> None:
+        """表示中の版に記憶したステップ数をスピンボックスへ出す。"""
+        v = self._current_turbo_variant()
+        steps = int(self._turbo_steps.get(
+            v, models_mod.TURBO_DEFAULT_STEPS.get(v, 4)))
+        self.sp_turbo_steps.blockSignals(True)
+        self.sp_turbo_steps.setValue(steps)
+        self.sp_turbo_steps.blockSignals(False)
+
+    def _on_turbo_steps_changed(self, val: int) -> None:
+        self._turbo_steps[self._current_turbo_variant()] = int(val)
+        self._schedule_save()
+
+    def _turbo_spec(self) -> dict:
+        """現在の Turbo LoRA の学習条件（steps / shift）。"""
+        return models_mod.TURBO_LORA_SPECS.get(self._turbo_lora_name(), {})
 
     def _turbo_lora_present(self, name: str) -> bool:
         p = self.paths.models / "loras" / name
@@ -908,6 +939,7 @@ class MainWindow(QMainWindow):
         if self._turbo_ckpt_kind() == "fl2va":
             self._turbo_fl2v_variant = (
                 self.cb_turbo_variant.currentData() or "8step")
+        self._load_turbo_steps()
         if self._loading:
             return
         self._schedule_save()
@@ -1780,7 +1812,12 @@ class MainWindow(QMainWindow):
         tv = str(s.get("turbo_variant", "8step"))
         if tv in dict(self._TURBO_VARIANTS["fl2va"]).values():
             self._turbo_fl2v_variant = tv
-        self.sp_turbo_steps.setValue(int(s.get("turbo_steps", 4)))
+        # 版ごとのステップ数（"版:数,…"）。壊れていれば既定のまま。
+        for part in str(s.get("turbo_steps_map", "")).split(","):
+            if ":" in part:
+                k, _, n = part.partition(":")
+                if k.strip() in self._turbo_steps and n.strip().isdigit():
+                    self._turbo_steps[k.strip()] = max(1, min(12, int(n)))
         self.chk_turbo.setChecked(bool(s.get("turbo_enabled", False)))
         self._sync_turbo_controls()
         si = self.cb_sparse_method.findData(str(s.get("sparse_method", "sol-attn")))
@@ -1829,7 +1866,6 @@ class MainWindow(QMainWindow):
         self.ed_seed.textChanged.connect(self._schedule_save)
         self.cb_ref_size.currentIndexChanged.connect(self._schedule_save)
         self.chk_ref_te_only.toggled.connect(self._schedule_save)
-        self.sp_turbo_steps.valueChanged.connect(self._schedule_save)
         self.chk_sparse.toggled.connect(self._schedule_save)
         self.cb_sparse_method.currentIndexChanged.connect(self._schedule_save)
         self.splitter.splitterMoved.connect(self._schedule_save)
@@ -1878,7 +1914,8 @@ class MainWindow(QMainWindow):
             "ref_image_size": self.cb_ref_size.currentData() or "match",
             "ref_te_only": self.chk_ref_te_only.isChecked(),
             "turbo_enabled": self.chk_turbo.isChecked(),
-            "turbo_steps": int(self.sp_turbo_steps.value()),
+            "turbo_steps_map": ",".join(
+                f"{k}:{int(v)}" for k, v in self._turbo_steps.items()),
             "turbo_variant": self._turbo_fl2v_variant,
             "sparse_enabled": self.chk_sparse.isChecked(),
             "sparse_method": self.cb_sparse_method.currentData() or "sol-attn",
@@ -2009,6 +2046,9 @@ class MainWindow(QMainWindow):
         # 未ダウンロードならここで止める（ダウンロード中も含む）。
         turbo_lora = ""
         steps = self.sp_steps.value()
+        shift_enabled = self.grp_shift.isChecked()
+        shift_video = float(self.sp_shift_video.value())
+        shift_audio = float(self.sp_shift_audio.value())
         if self.chk_turbo.isChecked():
             turbo_lora = self._turbo_lora_name()
             if not self._turbo_lora_present(turbo_lora):
@@ -2017,6 +2057,20 @@ class MainWindow(QMainWindow):
                     "高速化設定の Turbo LoRA を入れ直してダウンロードするか、"
                     "Models の「設定…」から Turbo LoRA セットを取得してください")
             steps = int(self.sp_turbo_steps.value())
+            # 学習時の shift が既定（12/3）と違う版は、Sigma Shift 未指定なら
+            # その値を自動適用する（手動 ON ならユーザー値を優先）。
+            spec = self._turbo_spec()
+            if not shift_enabled and spec.get("shift_video"):
+                shift_enabled = True
+                shift_video = float(spec["shift_video"])
+                shift_audio = float(spec.get("shift_audio") or shift_audio)
+                self.append_log(
+                    f"Turbo LoRA: 学習条件に合わせ Sigma Shift を "
+                    f"video {shift_video:g} / audio {shift_audio:g} に自動設定")
+            if self.chk_easycache.isChecked():
+                self.append_log(
+                    "\x1b[93m警告: Turbo LoRA（少ステップ）と EasyCache の併用は"
+                    "ステップスキップの影響が大きく品質が崩れやすいです\x1b[0m")
 
         guides = self._guide_params() if mode != "chain" else []
 
@@ -2035,9 +2089,9 @@ class MainWindow(QMainWindow):
             scheduler=self.cb_scheduler.currentText(),
             seed=seed,
             weight_dtype=self.cb_dtype.currentText(),
-            shift_enabled=self.grp_shift.isChecked(),
-            shift_video=float(self.sp_shift_video.value()),
-            shift_audio=float(self.sp_shift_audio.value()),
+            shift_enabled=shift_enabled,
+            shift_video=shift_video,
+            shift_audio=shift_audio,
             loras=[(e["name"], float(e["strength"]))
                    for e in self._current_loras()],
             chain=chain,

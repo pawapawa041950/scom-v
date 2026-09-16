@@ -90,6 +90,24 @@ TURBO_LORAS = {
 }
 TE_NVFP4 = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
 
+# Turbo LoRA の学習条件（配布元 ModelTC/Minimax-H3-Turbo の model specs）。
+# steps: 推奨ステップ数。shift: 学習時の flow shift（None = モデル既定 12/3）。
+# 4step 768p 版は shift 6/3 で学習されており、既定の 12 で回すと映像も音声も
+# 崩れるため、Sigma Shift 未指定時はこの値を自動適用する。
+TURBO_LORA_SPECS = {
+    TURBO_LORAS[("fl2va", "8step")]: {
+        "steps": 8, "shift_video": None, "shift_audio": None,
+        "note": "544p 学習・推奨 8（公式テンプレは 6、下限 4）"},
+    TURBO_LORAS[("fl2va", "4step_768p")]: {
+        "steps": 4, "shift_video": 6.0, "shift_audio": 3.0,
+        "note": "768p（1344x768）学習・shift 6/3・4 ステップ"},
+    TURBO_LORAS[("ref2va", "4step")]: {
+        "steps": 4, "shift_video": None, "shift_audio": None,
+        "note": "544p 学習・4 ステップ"},
+}
+# 版キー（UI のコンボ data）→ 既定ステップ数
+TURBO_DEFAULT_STEPS = {"8step": 8, "4step_768p": 4, "4step": 4}
+
 
 def turbo_lora_for(ckpt_kind: str, variant: str) -> str:
     """チェックポイント系統（fl2va / ref2va）と版から Turbo LoRA 名を返す。
