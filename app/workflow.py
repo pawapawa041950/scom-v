@@ -110,6 +110,10 @@ class GenParams:
     # ほど効く。method: sol-attn（学習不要・既定）| sla | vsa（専用重み向け）
     sparse_enabled: bool = False
     sparse_method: str = "sol-attn"
+    # sla / vsa の保持率（%）と、スパース化を始めるサンプリング進捗。
+    # sol-attn では keep_percent は使わない（tau 1.3 固定）。
+    sparse_keep_percent: float = 10.0
+    sparse_start: float = 0.2
     # r2v: 参照を VAE に通さず TE だけで効かせる（vae/audio_vae を繋がない）
     ref_te_only: bool = False
     # ガイド（MiniMaxH3AddGuide）: 任意フレームに画像/音声を固定する。
@@ -187,16 +191,21 @@ def _apply_model_patches(g: dict, p: GenParams) -> tuple[list, list]:
             raise ValueError(f"不明な Sparse Attention 方式です: {method}")
         # selection は DynamicCombo: 選択キー + "selection.<入力名>" で
         # 方式ごとのパラメータを渡す（ノード既定値をそのまま使う）。
+        start = min(1.0, max(0.0, float(p.sparse_start)))
         inputs: dict = {"model": model_src, "selection": method,
-                        "start_percent": 0.2, "end_percent": 1.0,
+                        "start_percent": start, "end_percent": 1.0,
                         "dense_blocks": "", "min_tokens": 12288,
-                        "extra_tokens": 256,
+                        # VSA では extra_tokens は使われない（0 にしておく）
+                        "extra_tokens": 0 if method == "vsa" else 256,
                         "sink_conditioning": "exact_kv_and_rows",
                         "verbose": False}
         if method == "sol-attn":
             inputs["selection.tau"] = 1.3
         else:
-            inputs["selection.keep_percent"] = 10.0
+            keep = float(p.sparse_keep_percent)
+            if not 0.5 <= keep <= 95.0:
+                raise ValueError(f"Sparse Attention の保持率が範囲外です: {keep}")
+            inputs["selection.keep_percent"] = keep
         g["18"] = {"class_type": "BlockSparseAttention", "inputs": inputs}
         model_src = ["18", 0]
     return model_src, clip_src

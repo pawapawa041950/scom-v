@@ -40,6 +40,8 @@ PRESET_TURBO = [
     "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
 ]
 PRESET_TE_NVFP4 = ["qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"]
+PRESET_FASTH3 = [
+    "fastvideo_fasth3_8step_v2_pruned_int8_convrot.safetensors", *_SHARED]
 QUICK_PRESETS = [
     ("t2v / i2v 必須セット (int8_convrot)", PRESET_CORE_INT8),
     ("t2v / i2v 必須セット (fp8_scaled)", PRESET_CORE_FP8),
@@ -47,6 +49,8 @@ QUICK_PRESETS = [
     ("r2v 追加セット (fp8_scaled)", PRESET_R2V_FP8),
     ("Turbo LoRA セット（4ステップ高速生成・fl2v+ref2v）", PRESET_TURBO),
     ("Text encoder nvfp4 版（軽量 15.7GB・公式テンプレ既定）", PRESET_TE_NVFP4),
+    ("FastH3 8-step V2（蒸留+Sparse 学習済み・t2v 専用・int8_convrot）",
+     PRESET_FASTH3),
 ]
 
 

@@ -264,6 +264,9 @@ class MainWindow(QMainWindow):
         box_models = QGroupBox("Models")
         form = QFormLayout(box_models)
         self.cb_diffusion = WideComboBox()
+        # FastH3 選択時は高速化設定を固定表示にする（_sync_fasth3_controls）。
+        self.cb_diffusion.currentTextChanged.connect(
+            lambda *_a: self._sync_fasth3_controls())
         self.cb_te = WideComboBox()
         self.cb_vae_video = WideComboBox()
         self.cb_vae_audio = WideComboBox()
@@ -848,7 +851,38 @@ class MainWindow(QMainWindow):
         sa.addWidget(self.cb_sparse_method)
         sa.addStretch(1)
         v.addLayout(sa)
+
+        # FastH3（蒸留+VSA 学習済み checkpoint）選択時の案内。学習条件に
+        # 合わせた設定を生成時に自動適用するため、上の行は操作不可にする。
+        self.lbl_fasth3 = QLabel(
+            "FastH3 選択中: 8 ステップ / Sigma Shift 10・3 / "
+            "Sparse Attention vsa 保持 20% を自動適用します"
+            "（Turbo LoRA・EasyCache は使われません）")
+        self.lbl_fasth3.setWordWrap(True)
+        self.lbl_fasth3.setStyleSheet("color:#39c;")
+        self.lbl_fasth3.setVisible(False)
+        v.addWidget(self.lbl_fasth3)
         return box
+
+    # ----- FastH3 ------------------------------------------------------------
+    def _fasth3_selected(self) -> bool:
+        return models_mod.is_fasth3(self.cb_diffusion.currentText())
+
+    def _sync_fasth3_controls(self) -> None:
+        """FastH3 選択中は Turbo / EasyCache / Sparse / Steps を固定表示にする。"""
+        if not hasattr(self, "lbl_fasth3"):
+            return
+        on = self._fasth3_selected() and self._mode() == "t2v"
+        self.lbl_fasth3.setVisible(on)
+        for w in (self.chk_turbo, self.chk_easycache, self.chk_sparse):
+            w.setEnabled(not on)
+        self.cb_turbo_variant.setEnabled(
+            not on and self.chk_turbo.isChecked())
+        self.sp_turbo_steps.setEnabled(not on and self.chk_turbo.isChecked())
+        self.sp_easycache.setEnabled(not on and self.chk_easycache.isChecked())
+        self.cb_sparse_method.setEnabled(
+            not on and self.chk_sparse.isChecked())
+        self.sp_steps.setEnabled(not on and not self.chk_turbo.isChecked())
 
     # ----- Turbo LoRA ------------------------------------------------------
     def _turbo_ckpt_kind(self) -> str:
@@ -926,6 +960,8 @@ class MainWindow(QMainWindow):
         self.sp_turbo_steps.setEnabled(on)
         self._refill_turbo_variants()
         self.cb_turbo_variant.setEnabled(on)
+        # FastH3 選択中は上書きで固定表示に戻す。
+        self._sync_fasth3_controls()
 
     def _on_turbo_toggled(self, checked: bool) -> None:
         self._sync_turbo_controls()
@@ -1297,11 +1333,16 @@ class MainWindow(QMainWindow):
 
     def _refill_diffusion(self) -> None:
         files = self._all_models.get("diffusion_models", [])
-        if self._mode() == "r2v":
+        mode = self._mode()
+        if mode == "r2v":
             wanted = [f for f in files if "ref2va" in f.lower()]
         else:
             wanted = [f for f in files if "ref2va" not in f.lower()]
+        # FastH3 は t2av 専用の蒸留なので t2v 以外の一覧からは外す。
+        if mode != "t2v":
+            wanted = [f for f in wanted if not models_mod.is_fasth3(f)]
         self._fill_combo(self.cb_diffusion, wanted or files)
+        self._sync_fasth3_controls()
 
     @staticmethod
     def _fill_combo(combo: QComboBox, items: list[str]) -> None:
@@ -1847,6 +1888,7 @@ class MainWindow(QMainWindow):
             except ValueError:
                 pass
         self._update_size_label()
+        self._sync_fasth3_controls()
 
     def _connect_autosave(self) -> None:
         for combo in (self.cb_mode, self.cb_diffusion, self.cb_te,
@@ -2074,9 +2116,38 @@ class MainWindow(QMainWindow):
 
         guides = self._guide_params() if mode != "chain" else []
 
+        # Sparse Attention（FastH3 は学習条件で上書き）
+        sparse_enabled = self.chk_sparse.isChecked()
+        sparse_method = self.cb_sparse_method.currentData() or "sol-attn"
+        sparse_keep = 10.0
+        sparse_start = 0.2
+        easycache_enabled = self.chk_easycache.isChecked()
+        diffusion = self.cb_diffusion.currentText().strip()
+        if models_mod.is_fasth3(diffusion):
+            if mode != "t2v":
+                raise ValueError(
+                    "FastH3 は t2v 専用です（i2v / r2v / チェーンの蒸留は"
+                    "含まれていません）。Diffusion モデルを切り替えてください")
+            spec = models_mod.FASTH3_SPEC
+            turbo_lora = ""
+            easycache_enabled = False
+            steps = int(spec["steps"])
+            if not self.grp_shift.isChecked():
+                shift_enabled = True
+                shift_video = float(spec["shift_video"])
+                shift_audio = float(spec["shift_audio"])
+            sparse_enabled = True
+            sparse_method = str(spec["sparse_method"])
+            sparse_keep = float(spec["sparse_keep_percent"])
+            sparse_start = float(spec["sparse_start"])
+            self.append_log(
+                f"FastH3: {steps} ステップ / Sigma Shift video {shift_video:g} "
+                f"audio {shift_audio:g} / Sparse Attention {sparse_method} "
+                f"保持 {sparse_keep:g}% を自動適用")
+
         return GenParams(
             mode=mode,
-            diffusion=self.cb_diffusion.currentText().strip(),
+            diffusion=diffusion,
             te=self.cb_te.currentText().strip(),
             vae_video=self.cb_vae_video.currentText().strip(),
             vae_audio=self.cb_vae_audio.currentText().strip(),
@@ -2095,7 +2166,7 @@ class MainWindow(QMainWindow):
             loras=[(e["name"], float(e["strength"]))
                    for e in self._current_loras()],
             chain=chain,
-            easycache_enabled=self.chk_easycache.isChecked(),
+            easycache_enabled=easycache_enabled,
             easycache_threshold=float(self.sp_easycache.value()),
             first_frame=first,
             last_frame=last,
@@ -2105,8 +2176,10 @@ class MainWindow(QMainWindow):
             ref_audios=ref_audios,
             ref_te_only=self.chk_ref_te_only.isChecked(),
             turbo_lora=turbo_lora,
-            sparse_enabled=self.chk_sparse.isChecked(),
-            sparse_method=self.cb_sparse_method.currentData() or "sol-attn",
+            sparse_enabled=sparse_enabled,
+            sparse_method=sparse_method,
+            sparse_keep_percent=sparse_keep,
+            sparse_start=sparse_start,
             guides=guides,
         )
 

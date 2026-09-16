@@ -70,6 +70,14 @@ DEFAULT_MODELS: list[ModelFile] = [
         1_956_192_992),
     _h3("loras", "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
         1_956_193_000),
+    # --- FastVideo FastH3 8-step V2（蒸留 + VSA 学習済みのフル checkpoint。
+    #     t2v 専用。shift 10/3・8 ステップ・vsa 保持 20% で使う）------------
+    ModelFile("diffusion_models",
+              "fastvideo_fasth3_8step_v2_pruned_int8_convrot.safetensors",
+              "https://huggingface.co/FastVideo/FastVideo-FastH3-Comfy/resolve/"
+              "main/diffusion_models/"
+              "fastvideo_fasth3_8step_v2_pruned_int8_convrot.safetensors",
+              22_128_378_696, required=False),
     # --- プレビュー用 tiny デコーダ（コミュニティ製、9.8MB）------------------
     # サンプリング中プレビューを Latent2RGB より大幅に高品質化する。
     # 選択UIには出さず、セットアップ時と通常起動時に自動取得する。
@@ -107,6 +115,22 @@ TURBO_LORA_SPECS = {
 }
 # 版キー（UI のコンボ data）→ 既定ステップ数
 TURBO_DEFAULT_STEPS = {"8step": 8, "4step_768p": 4, "4step": 4}
+
+# FastVideo FastH3: DMD2 で 8 ステップに蒸留し VSA（疎密度 80%）で学習した
+# フル checkpoint。学習条件（fastvideo_inference.json）に合わせて使う。
+# t2av のみ蒸留されているため i2v / r2v / チェーンでは使わない。
+FASTH3_SPEC = {
+    "steps": 8,
+    "shift_video": 10.0,
+    "shift_audio": 3.0,
+    "sparse_method": "vsa",
+    "sparse_keep_percent": 20.0,   # 疎密度 0.8 = 保持 20%
+    "sparse_start": 0.0,           # 学習時は全ステップ疎なので最初から
+}
+
+
+def is_fasth3(filename: str) -> bool:
+    return "fasth3" in (filename or "").lower()
 
 
 def turbo_lora_for(ckpt_kind: str, variant: str) -> str:
