@@ -49,6 +49,12 @@ DEFAULT_MODELS: list[ModelFile] = [
         20_970_379_616),
     _h3("diffusion_models", "minimax_h3_ref2va_pruned_fp8_scaled.safetensors",
         20_958_205_608),
+    # w6a8（6bit 重み + int8 活性。ComfyUI v0.38+ で対応。int8_convrot より
+    # 約 5GB 小さい）
+    _h3("diffusion_models", "minimax_h3_fl2va_pruned_w6a8.safetensors",
+        15_983_746_636),
+    _h3("diffusion_models", "minimax_h3_ref2va_pruned_w6a8.safetensors",
+        15_983_746_636),
     # --- text encoder (Qwen3-VL-32B) ---------------------------------------
     _h3("text_encoders", "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
         27_141_342_152, required=True),
