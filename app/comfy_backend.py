@@ -321,6 +321,10 @@ class ComfyBackend:
             "--preview-method", "auto",  # stream latent previews over the ws
             "--preview-size", "768",     # taeh3 デコードは16倍なので粗くしない
             "--disable-auto-launch",
+            # v0.37 以降は高速ディスクを自動検出してディスク経由の動的読込に
+            # 切り替わるが、scom ではこれでプロセスごと落ちる事例があった
+            # （anima / krea2 の TE で再現）。従来どおり RAM 経由で読む。
+            "--disable-fast-disk",
             # ComfyUI のアセット DB は使わない。メモリ上にすると comfyui.db の
             # ファイルロックが無くなり、残留/多重起動時の「Database is
             # locked」とその待ちが起きない。
