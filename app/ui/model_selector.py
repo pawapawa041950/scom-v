@@ -46,6 +46,8 @@ PRESET_TURBO = [
 PRESET_TE_NVFP4 = ["qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"]
 PRESET_FASTH3 = [
     "fastvideo_fasth3_8step_v2_pruned_int8_convrot.safetensors", *_SHARED]
+PRESET_SOL_VAE_FP16 = ["minimax_h3_sol_vae_fp16.safetensors"]
+PRESET_SOL_VAE_INT8 = ["minimax_h3_sol_vae_int8_convrot.safetensors"]
 QUICK_PRESETS = [
     ("t2v / i2v 必須セット (int8_convrot)", PRESET_CORE_INT8),
     ("t2v / i2v 必須セット (fp8_scaled)", PRESET_CORE_FP8),
@@ -57,6 +59,9 @@ QUICK_PRESETS = [
     ("Text encoder nvfp4 版（軽量 15.7GB・公式テンプレ既定）", PRESET_TE_NVFP4),
     ("FastH3 8-step V2（蒸留+Sparse 学習済み・t2v 専用・int8_convrot）",
      PRESET_FASTH3),
+    ("Sol-H3-VAE fp16（動画 VAE の高速版・デコード約 3〜6 倍速）",
+     PRESET_SOL_VAE_FP16),
+    ("Sol-H3-VAE int8_convrot（同・軽量 2.0GB）", PRESET_SOL_VAE_INT8),
 ]
 
 

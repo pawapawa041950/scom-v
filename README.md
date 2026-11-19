@@ -18,6 +18,7 @@ Windowsにおいて1ウィンドウだけでお手軽に**動画生成**する�
 * 自動連続生成・生成タスクのキューイングに対応しています。
 * 生成の高速化を行うSage Attention、EasyCache、Turbo LoRA（公式の4〜8ステップ蒸留LoRA）、Sparse Attentionに対応しています。設定からON/OFFできます。
 * 軽量なnvfp4版テキストエンコーダ（15.7GB）もアプリ内からダウンロードできます。
+* 動画VAEの高速版Sol-H3-VAE（fp16 3.6GB / int8 2.0GB、デコードが約3〜6倍速い）をアプリ内からダウンロードし、「動画 VAE」で選んで使えます。
 * 蒸留とSparse Attentionを学習済みのFastVideo FastH3（8ステップ・t2v専用）に対応しています。選択すると学習条件（ステップ数・Sigma Shift・Sparse設定）を自動適用します。
 * r2vの「TEのみ参照」（VAEを通さない高速参照）、任意フレームへ画像・音声を固定するガイド機能に対応しています。
 

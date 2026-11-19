@@ -63,6 +63,10 @@ DEFAULT_MODELS: list[ModelFile] = [
         5_207_808_496, required=True),
     _h3("vae", "minimax_h3_audio_vae_fp32.safetensors",
         605_254_808, required=True),
+    # --- Sol-H3-VAE（蒸留デコーダ + H3 エンコーダ同梱。ComfyUI v0.44+。
+    #     デコードが標準 VAE の約 3〜6 倍速い。動画 VAE の代わりに選ぶ）--------
+    _h3("vae", "minimax_h3_sol_vae_fp16.safetensors", 3_596_335_728),
+    _h3("vae", "minimax_h3_sol_vae_int8_convrot.safetensors", 1_988_306_504),
     # --- text encoder nvfp4 版（15.7GB。Blackwell 不要と公式 README に明記。
     #     公式テンプレートの既定。int8 版より 11GB 軽い）--------------------
     _h3("text_encoders", "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",

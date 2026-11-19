@@ -58,6 +58,8 @@ _IMAGE_FILTER = "画像 (*.png *.jpg *.jpeg *.webp *.bmp);;すべて (*.*)"
 _VIDEO_FILTER = "動画 (*.mp4 *.webm *.mkv *.mov *.avi);;すべて (*.*)"
 _AUDIO_FILTER = "音声 (*.wav *.mp3 *.flac *.ogg *.m4a);;すべて (*.*)"
 _VIDEO_EXTS = (".mp4", ".webm", ".mkv", ".mov", ".avi")
+# 動画 VAE と見なす名前（標準 VAE 優先。Sol-H3-VAE も動画 VAE として扱う）
+_VIDEO_VAE_KEYS = ("video", "sol_vae")
 
 
 # SageAttention インストールジョブ（親なしスレッド）の生存参照。UI 側の
@@ -1328,7 +1330,7 @@ class MainWindow(QMainWindow):
         vaes = self._all_models["vae"]
         self._fill_combo(self.cb_vae_video, vaes)
         self._fill_combo(self.cb_vae_audio, vaes)
-        self._auto_pick(self.cb_vae_video, "video")
+        self._auto_pick(self.cb_vae_video, _VIDEO_VAE_KEYS)
         self._auto_pick(self.cb_vae_audio, "audio")
 
     def _refill_diffusion(self) -> None:
@@ -1356,14 +1358,18 @@ class MainWindow(QMainWindow):
         combo.blockSignals(False)
 
     @staticmethod
-    def _auto_pick(combo: QComboBox, substr: str) -> None:
-        """現在の選択が substr を含まないとき、含む項目へ自動で合わせる。"""
-        if substr in combo.currentText().lower():
+    def _auto_pick(combo: QComboBox, substr) -> None:
+        """現在の選択が substr を含まないとき、含む項目へ自動で合わせる。
+        substr はタプルも可（前にあるものを優先）。"""
+        subs = (substr,) if isinstance(substr, str) else tuple(substr)
+        cur = combo.currentText().lower()
+        if any(s in cur for s in subs):
             return
-        for i in range(combo.count()):
-            if substr in combo.itemText(i).lower():
-                combo.setCurrentIndex(i)
-                return
+        for s in subs:
+            for i in range(combo.count()):
+                if s in combo.itemText(i).lower():
+                    combo.setCurrentIndex(i)
+                    return
 
     # ----- 設定ウィンドウ --------------------------------------------------
     def open_models_dialog(self) -> None:
@@ -1834,7 +1840,7 @@ class MainWindow(QMainWindow):
                 or "audio" not in self.cb_vae_audio.currentText().lower()):
             self._auto_pick(self.cb_vae_audio, "audio")
         if "audio" in self.cb_vae_video.currentText().lower():
-            self._auto_pick(self.cb_vae_video, "video")
+            self._auto_pick(self.cb_vae_video, _VIDEO_VAE_KEYS)
         ai = self.cb_aspect.findText(str(s.get("aspect", "16:9")))
         if ai >= 0:
             self.cb_aspect.setCurrentIndex(ai)
