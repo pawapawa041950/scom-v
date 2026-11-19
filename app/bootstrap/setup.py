@@ -27,17 +27,21 @@ LogCb = Callable[[str], None]
 # Pin ComfyUI to a specific release tag for reproducible installs. The short
 # /archive/<ref>.zip form resolves tags, branches, and commit SHAs alike, so
 # SCOM_COMFYUI_REF can be overridden with any of them (e.g. "master").
+# v0.46.0 (2026-11-18): Sol-H3-VAE（蒸留デコーダ）、PDD+LoRA 併用修正、
+# オフロード時の重み破損防止、動的 VRAM のスケジュール漏れ修正、
+# GetVideoComponents の省メモリ化、MiniMax-H3-Image 対応に伴う H3 本体の改修、
+# comfy-kitchen 0.2.41 / comfy-aimdo 0.6.0。
 # v0.42.4 (2026-10-21): MiniMax-H3 のピーク VRAM 削減、H3 VAE のオフロード
 # 修正・タイル継ぎ目改善、PDD 焼き込みモデルと PDD への LoRA 適用、w6a8 量子化、
 # 軽量 H3 VAE 対応、SaveVideo の既定 CRF 18、comfy-kitchen 0.2.39 /
 # comfy-aimdo 0.5.6（v0.36.0 は H3 VAE 高速化、v0.35.0 は Turbo LoRA 等）。
-COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF", "v0.42.4")
+COMFYUI_REF = os.environ.get("SCOM_COMFYUI_REF", "v0.46.0")
 COMFYUI_ZIP = f"https://github.com/comfyanonymous/ComfyUI/archive/{COMFYUI_REF}.zip"
 
 # Bump when a newer ComfyUI is required. Changing this re-fetches ComfyUI and
 # reinstalls its deps on machines that were provisioned with an older copy.
 # Tied to the pinned ref so the provisioned version is self-documenting.
-COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "v0.42.4")
+COMFYUI_MARKER = os.environ.get("SCOM_COMFYUI_MARKER", "v0.46.0")
 
 # Fixed (non-model) steps, in order: (step_id, title).
 # Technical names (uv / PyTorch / ComfyUI) are kept in English by request.
